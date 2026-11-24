@@ -146,6 +146,7 @@ mod cli {
                 startup_delay_ms: 0,
                 width: None,
                 window_id: None,
+                pid: None,
             });
             match ev {
                 Event::RecordingEvent { .. } => {}

@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_CLIPSD_capture",
+    "type": "GLOBAL",
+    "api_version": "1.4.0",
+    "library_path": "@LIB_PATH@",
+    "implementation_version": "1",
+    "description": "clipsd zero-copy Vulkan DMA-BUF capture layer (dormant until clipsd connects)",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {
+      "CLIPSD_VK_DISABLE": "1"
+    }
+  }
+}

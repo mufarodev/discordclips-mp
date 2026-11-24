@@ -1,24 +1,57 @@
-//! M7 & M8: Linux hardware video (`av1_nvenc` on RTX 40+ → `h264_nvenc` → `libx264`) and
-//! AAC-LC audio encoding via `libavcodec`.
+//! Linux hardware video (`av1_nvenc` → `h264_nvenc` → `libx264`, with zero-copy CUDA hwframes
+//! via `gpu::GpuCudaBridge`) and AAC-LC audio encoding via `libavcodec`.
 //!
 //! - For AV1 (`av1_nvenc`), strips temporal delimiters and extracts `av1C` via
 //!   `clipsd_core::av1::{prepare_av1_sample, build_av1c}` so `clipsd_core::mux` writes a
 //!   spec-compliant `av01` + `av1C` MP4 accepted by Discord's `mp4box.js` clip editor.
-//! - For H.264 (`h264_nvenc`, `h264_vaapi`, `libx264`), converts Annex-B packets to 4-byte
-//!   length-prefixed AVCC + SPS/PPS via `clipsd_core::h264`.
+//! - For H.264 (`h264_nvenc`, `libx264`), converts Annex-B packets to 4-byte length-prefixed AVCC
+//!   + SPS/PPS via `clipsd_core::h264`.
 //!
 //! Override encoder selection with `CLIPSD_ENCODER=av1_nvenc|h264_nvenc|libx264` or
 //! `CLIPSD_CODEC=av1|h264`.
-//!
-//! NOTE: Scaffolded on macOS against `ffmpeg-next 7`; verify `av1_nvenc` option names and
-//! zero-copy CUDA/VAAPI `AVHWFramesContext` wiring on Linux (see LINUX_HANDOFF.md).
+
+use std::ffi::c_void;
+use std::ptr;
 
 use clipsd_core::av1::{build_av1c, prepare_av1_sample};
 use clipsd_core::h264::{annex_b_to_avcc, parse_extradata_sps_pps};
 use clipsd_core::{AudioConfig, CodecConfig, Encoder, Packet, AAC_FRAME_SAMPLES};
 use ffmpeg_next as ffmpeg;
+use ffmpeg_next::sys as ff;
 
-use crate::capture::{Frame, PixelFormat};
+use crate::capture::{CpuFrame, Frame, PixelFormat};
+use crate::gpu::GpuCudaBridge;
+
+/// Mirrors `AVCUDADeviceContext` in `<libavutil/hwcontext_cuda.h>`.
+#[repr(C)]
+struct AvCudaDeviceContext {
+    cuda_ctx: *mut c_void,
+    stream: *mut c_void,
+    internal: *mut c_void,
+}
+
+const AV_CUDA_USE_PRIMARY_CONTEXT: libc::c_int = 1 << 0;
+
+struct CudaEncoderState {
+    hw_device_ctx: *mut ff::AVBufferRef,
+    hw_frames_ctx: *mut ff::AVBufferRef,
+    bridge: Option<GpuCudaBridge>,
+}
+
+impl Drop for CudaEncoderState {
+    fn drop(&mut self) {
+        // Destroy the EGL/GL-CUDA interop resources FIRST while FFmpeg's CUcontext is still alive.
+        drop(self.bridge.take());
+        unsafe {
+            if !self.hw_frames_ctx.is_null() {
+                ff::av_buffer_unref(&mut self.hw_frames_ctx);
+            }
+            if !self.hw_device_ctx.is_null() {
+                ff::av_buffer_unref(&mut self.hw_device_ctx);
+            }
+        }
+    }
+}
 
 pub struct EncoderConfig {
     pub width: usize,
@@ -26,11 +59,12 @@ pub struct EncoderConfig {
     pub fps: i32,
     pub bitrate_bps: i32,
     pub keyframe_secs: i32,
+    pub prefer_cuda: bool,
 }
 
 impl EncoderConfig {
     pub fn new(width: usize, height: usize) -> Self {
-        Self { width, height, fps: 30, bitrate_bps: 8_000_000, keyframe_secs: 2 }
+        Self { width, height, fps: 30, bitrate_bps: 8_000_000, keyframe_secs: 2, prefer_cuda: false }
     }
 }
 
@@ -43,8 +77,9 @@ enum VideoCodecKind {
 pub struct FfmpegVideoEncoder {
     encoder: ffmpeg::codec::encoder::Video,
     kind: VideoCodecKind,
+    cuda: Option<CudaEncoderState>,
     scaler: Option<ffmpeg::software::scaling::Context>,
-    scaler_src_fmt: Option<ffmpeg::format::Pixel>,
+    scaler_key: Option<(ffmpeg::format::Pixel, u32, u32)>,
     width: u32,
     height: u32,
     sps: Option<Vec<u8>>,
@@ -96,7 +131,26 @@ impl FfmpegVideoEncoder {
             };
             video.set_width(cfg.width as u32);
             video.set_height(cfg.height as u32);
-            video.set_format(ffmpeg::format::Pixel::NV12);
+            let mut cuda_state: Option<CudaEncoderState> = None;
+            let try_cuda = cfg.prefer_cuda && name.ends_with("_nvenc");
+            if try_cuda {
+                match init_cuda_hwframes(cfg.width as u32, cfg.height as u32) {
+                    Ok(cs) => {
+                        unsafe {
+                            let avctx = video.as_mut_ptr();
+                            (*avctx).pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_CUDA;
+                            (*avctx).hw_frames_ctx = ff::av_buffer_ref(cs.hw_frames_ctx);
+                        }
+                        cuda_state = Some(cs);
+                    }
+                    Err(e) => {
+                        eprintln!("clipsd-linux: CUDA hwframes init failed ({e}); falling back to CPU NV12");
+                        video.set_format(ffmpeg::format::Pixel::NV12);
+                    }
+                }
+            } else {
+                video.set_format(ffmpeg::format::Pixel::NV12);
+            }
             video.set_time_base(ffmpeg::Rational(1, 1_000_000));
             video.set_frame_rate(Some(ffmpeg::Rational(cfg.fps.max(1), 1)));
             video.set_bit_rate(cfg.bitrate_bps as usize);
@@ -130,15 +184,20 @@ impl FfmpegVideoEncoder {
             match video.open_as_with(codec, opts) {
                 Ok(opened) => {
                     eprintln!(
-                        "clipsd-linux: opened video encoder '{name}' ({:?}, {}x{} @ {}fps)",
-                        kind, cfg.width, cfg.height, cfg.fps
+                        "clipsd-linux: opened video encoder '{name}' ({:?}, {}x{} @ {}fps, {})",
+                        kind,
+                        cfg.width,
+                        cfg.height,
+                        cfg.fps,
+                        if cuda_state.is_some() { "CUDA zero-copy" } else { "CPU NV12" }
                     );
                     let (sps, pps, av1c) = extract_extradata(&opened, kind);
                     return Ok(Self {
                         encoder: opened,
                         kind,
+                        cuda: cuda_state,
                         scaler: None,
-                        scaler_src_fmt: None,
+                        scaler_key: None,
                         width: cfg.width as u32,
                         height: cfg.height as u32,
                         sps,
@@ -230,10 +289,54 @@ fn extract_extradata(
     (None, None, None)
 }
 
-impl Encoder for FfmpegVideoEncoder {
-    type Frame = Frame;
+fn init_cuda_hwframes(width: u32, height: u32) -> Result<CudaEncoderState, String> {
+    unsafe {
+        let mut hw_device_ctx: *mut ff::AVBufferRef = ptr::null_mut();
+        let rc = ff::av_hwdevice_ctx_create(
+            &mut hw_device_ctx,
+            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            ptr::null(),
+            ptr::null_mut(),
+            AV_CUDA_USE_PRIMARY_CONTEXT,
+        );
+        if rc < 0 || hw_device_ctx.is_null() {
+            return Err(format!("av_hwdevice_ctx_create(CUDA) failed ({rc})"));
+        }
+        let hw_frames_ctx = ff::av_hwframe_ctx_alloc(hw_device_ctx);
+        if hw_frames_ctx.is_null() {
+            ff::av_buffer_unref(&mut hw_device_ctx);
+            return Err("av_hwframe_ctx_alloc failed".into());
+        }
+        let frames = (*hw_frames_ctx).data as *mut ff::AVHWFramesContext;
+        (*frames).format = ff::AVPixelFormat::AV_PIX_FMT_CUDA;
+        (*frames).sw_format = ff::AVPixelFormat::AV_PIX_FMT_RGB0;
+        (*frames).width = width as libc::c_int;
+        (*frames).height = height as libc::c_int;
+        (*frames).initial_pool_size = 8;
+        let init_rc = ff::av_hwframe_ctx_init(hw_frames_ctx);
+        if init_rc < 0 {
+            let mut f = hw_frames_ctx;
+            ff::av_buffer_unref(&mut f);
+            ff::av_buffer_unref(&mut hw_device_ctx);
+            return Err(format!("av_hwframe_ctx_init(CUDA/RGB0) failed ({init_rc})"));
+        }
+        let dev = (*hw_device_ctx).data as *mut ff::AVHWDeviceContext;
+        let cu_dev = (*dev).hwctx as *mut AvCudaDeviceContext;
+        let bridge = match GpuCudaBridge::new(width, height, (*cu_dev).cuda_ctx, (*cu_dev).stream) {
+            Ok(b) => b,
+            Err(e) => {
+                let mut f = hw_frames_ctx;
+                ff::av_buffer_unref(&mut f);
+                ff::av_buffer_unref(&mut hw_device_ctx);
+                return Err(e);
+            }
+        };
+        Ok(CudaEncoderState { hw_device_ctx, hw_frames_ctx, bridge: Some(bridge) })
+    }
+}
 
-    fn encode(&mut self, frame: Frame, pts_us: i64) -> Result<Vec<Packet>, String> {
+impl FfmpegVideoEncoder {
+    fn encode_cpu(&mut self, frame: CpuFrame, pts_us: i64) -> Result<Vec<Packet>, String> {
         let src_pix = match frame.format {
             PixelFormat::Bgra | PixelFormat::Bgrx => ffmpeg::format::Pixel::BGRA,
             PixelFormat::Nv12 => ffmpeg::format::Pixel::NV12,
@@ -262,7 +365,8 @@ impl Encoder for FfmpegVideoEncoder {
         let mut nv12 = if src_pix == ffmpeg::format::Pixel::NV12 && frame.width == self.width && frame.height == self.height {
             src
         } else {
-            if self.scaler.is_none() || self.scaler_src_fmt != Some(src_pix) {
+            let key = (src_pix, frame.width, frame.height);
+            if self.scaler.is_none() || self.scaler_key != Some(key) {
                 self.scaler = Some(
                     ffmpeg::software::scaling::Context::get(
                         src_pix,
@@ -271,11 +375,11 @@ impl Encoder for FfmpegVideoEncoder {
                         ffmpeg::format::Pixel::NV12,
                         self.width,
                         self.height,
-                        ffmpeg::software::scaling::Flags::FAST_BILINEAR,
+                        ffmpeg::software::scaling::Flags::BILINEAR,
                     )
                     .map_err(|e| format!("swscale: {e}"))?,
                 );
-                self.scaler_src_fmt = Some(src_pix);
+                self.scaler_key = Some(key);
             }
             let mut dst = ffmpeg::util::frame::Video::empty();
             self.scaler.as_mut().unwrap().run(&src, &mut dst).map_err(|e| format!("swscale run: {e}"))?;
@@ -285,6 +389,55 @@ impl Encoder for FfmpegVideoEncoder {
         nv12.set_pts(Some(pts_us));
         self.encoder.send_frame(&nv12).map_err(|e| format!("encode send_frame: {e}"))?;
         self.drain()
+    }
+}
+
+impl Encoder for FfmpegVideoEncoder {
+    type Frame = Frame;
+
+    fn encode(&mut self, frame: Frame, pts_us: i64) -> Result<Vec<Packet>, String> {
+        match frame {
+            Frame::DmaBuf(db) => {
+                let cs = self.cuda.as_mut().ok_or("received DMA-BUF frame without CUDA encoder")?;
+                let mut hw_frame = ffmpeg::util::frame::Video::empty();
+                unsafe {
+                    let av_f = hw_frame.as_mut_ptr();
+                    let rc = ff::av_hwframe_get_buffer(cs.hw_frames_ctx, av_f, 0);
+                    if rc < 0 {
+                        return Err(format!("av_hwframe_get_buffer failed ({rc})"));
+                    }
+                    let dev_ptr = (*av_f).data[0] as u64;
+                    let pitch = (*av_f).linesize[0] as usize;
+                    cs.bridge.as_mut().unwrap().import_to_cuda_frame(&db, dev_ptr, pitch)?;
+                    (*av_f).pts = pts_us;
+                }
+                self.encoder.send_frame(&hw_frame).map_err(|e| format!("cuda send_frame: {e}"))?;
+                self.drain()
+            }
+            Frame::RepeatLastGpu => {
+                let cs = self.cuda.as_mut().ok_or("received RepeatLastGpu without CUDA encoder")?;
+                let mut hw_frame = ffmpeg::util::frame::Video::empty();
+                unsafe {
+                    let av_f = hw_frame.as_mut_ptr();
+                    let rc = ff::av_hwframe_get_buffer(cs.hw_frames_ctx, av_f, 0);
+                    if rc < 0 {
+                        return Err(format!("av_hwframe_get_buffer failed ({rc})"));
+                    }
+                    let dev_ptr = (*av_f).data[0] as u64;
+                    let pitch = (*av_f).linesize[0] as usize;
+                    cs.bridge.as_ref().unwrap().copy_last_to_cuda_frame(dev_ptr, pitch)?;
+                    (*av_f).pts = pts_us;
+                }
+                self.encoder.send_frame(&hw_frame).map_err(|e| format!("cuda repeat send_frame: {e}"))?;
+                self.drain()
+            }
+            Frame::Cpu(cpu) => {
+                if self.cuda.is_some() {
+                    return Err("received CPU frame on CUDA-only encoder".into());
+                }
+                self.encode_cpu(cpu, pts_us)
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>, String> {
@@ -341,6 +494,22 @@ impl FfmpegAacEncoder {
         let frame_samples = AAC_FRAME_SAMPLES as usize;
         if self.next_pts_us.is_none() {
             self.next_pts_us = Some(pts_us);
+        }
+        // A sink monitor stops delivering while the sink is idle/suspended. Keep audio on the
+        // capture clock by padding any gap with silence (otherwise audio drifts early vs video).
+        let rate = self.cfg.sample_rate as i64;
+        let buffered_us = (self.pcm_buf.len() / ch) as i64 * 1_000_000 / rate;
+        let expected_us = self.next_pts_us.unwrap_or(pts_us) + buffered_us;
+        let gap_us = pts_us - expected_us;
+        if gap_us > 40_000 {
+            if gap_us > 10_000_000 {
+                // Huge discontinuity: restart the timeline instead of writing seconds of zeros.
+                self.pcm_buf.clear();
+                self.next_pts_us = Some(pts_us);
+            } else {
+                let n = (gap_us * rate / 1_000_000) as usize * ch;
+                self.pcm_buf.resize(self.pcm_buf.len() + n, 0.0);
+            }
         }
         self.pcm_buf.extend_from_slice(interleaved_f32);
 

@@ -138,6 +138,7 @@ mod cli {
                 startup_delay_ms: 0,
                 width: None,
                 window_id: None,
+                pid: flag(args, "--pid").and_then(|s| s.parse::<u32>().ok()),
             });
             match ev {
                 Event::RecordingEvent { .. } => {}

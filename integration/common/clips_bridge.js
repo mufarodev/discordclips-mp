@@ -232,6 +232,7 @@ function attachClipsBridge(VoiceEngine, features) {
   let recordingActive = false;
   let activeSourceId = "";
   let activeWindowId = null;
+  let activePid = null;
 
   const settings = {
     fps: 30,
@@ -271,7 +272,7 @@ function attachClipsBridge(VoiceEngine, features) {
     }
   }
 
-  async function startCapture(windowId) {
+  async function startCapture(windowId, pid) {
     if (recordingActive) {
       await client.call({ type: "StopRecording" }).catch(() => {});
       recordingActive = false;
@@ -284,10 +285,12 @@ function attachClipsBridge(VoiceEngine, features) {
       startup_delay_ms: 0,
       width: settings.width || 1920,
       window_id: windowId ?? null,
+      pid: pid ?? null,
     });
     if (ev.type === "RecordingEvent" && ev.state === "started") {
       recordingActive = true;
       activeWindowId = windowId ?? null;
+      activePid = pid ?? null;
       emitEvent(RecordingEvent.Started);
       emitEvent(RecordingEvent.RecordingActive);
       emitEvent(RecordingEvent.RecordingHealthy);
@@ -303,6 +306,7 @@ function attachClipsBridge(VoiceEngine, features) {
   async function stopCapture() {
     activeSourceId = "";
     activeWindowId = null;
+    activePid = null;
     if (!recordingActive) return;
     recordingActive = false;
     await client.call({ type: "StopRecording" }).catch(() => {});
@@ -385,15 +389,31 @@ function attachClipsBridge(VoiceEngine, features) {
     }
     activeSourceId = id;
     const windowId = parseWindowId(id);
-    serialize(() =>
-      startCapture(windowId).catch((err) => {
+    const pid =
+      Number.isInteger(source?.soundshareId) && source.soundshareId > 0 ? source.soundshareId : null;
+    serialize(async () => {
+      // On Linux, if we are already recording this exact game PID, keep the ring buffer intact
+      // and re-emit readiness events. If a new game PID arrived (e.g. upgrading from the initial
+      // portal fallback to a hooked Vulkan game), restart with `pid` so clipsd attaches directly
+      // to the game's Vulkan DMA-BUF layer when available.
+      if (process.platform === "linux" && recordingActive && (pid == null || pid === activePid)) {
+        activeWindowId = windowId;
+        emitEvent(RecordingEvent.Started);
+        emitEvent(RecordingEvent.RecordingActive);
+        emitEvent(RecordingEvent.RecordingHealthy);
+        return;
+      }
+      try {
+        await startCapture(windowId, pid);
+      } catch (err) {
         console.error("[clipsd-bridge] startCapture failed:", err);
-      })
-    );
+      }
+    });
   };
 
   VoiceEngine.saveClipEx = function (opts, onSuccess, onError) {
     const filepath = opts?.filepath;
+    console.info("[clipsd-bridge] saveClipEx:", filepath, "active=", recordingActive);
     if (!filepath) {
       onError?.(JSON.stringify({ errorMessage: "missing filepath", errorAt: "bridge" }));
       return;
@@ -448,6 +468,7 @@ function attachClipsBridge(VoiceEngine, features) {
           throw { errorMessage: "buffer warming up (not recording)", errorAt: "buffer_warming_up" };
         }
         const ev = await client.call(cmd);
+        console.info("[clipsd-bridge] saveClipEx reply:", ev.type, ev.error || ev.message || "");
         if (ev.type === "ClipSaved") {
           const metaStr = ev.metadata ? JSON.stringify(ev.metadata) : "";
           onSuccess?.(ev.duration_ms ?? 0, ev.stats_json ?? "{}", ev.thumbnail ?? "", metaStr);
@@ -456,6 +477,7 @@ function attachClipsBridge(VoiceEngine, features) {
         const errMsg = ev.error || ev.message || `clip save failed (${ev.type})`;
         onError?.(JSON.stringify({ errorMessage: errMsg, errorAt: "clipsd" }));
       } catch (err) {
+        console.warn("[clipsd-bridge] saveClipEx failed:", err?.errorMessage || err?.message || err);
         if (err && typeof err === "object" && "errorMessage" in err) {
           onError?.(JSON.stringify(err));
         } else {
@@ -539,6 +561,22 @@ function attachClipsBridge(VoiceEngine, features) {
     features.declareSupported("clips");
     features.declareSupported("clips_thumbnail");
     features.declareSupported("clips_recording_ready_events");
+  }
+
+  // Optional diagnostics: set CLIPSD_TRACE=1 to log every Clips-related VoiceEngine call.
+  if (process.env.CLIPSD_TRACE) {
+    const names = Object.keys(VoiceEngine).filter((k) => /clip|screenshot/i.test(k) && typeof VoiceEngine[k] === "function");
+    console.info("[clipsd-bridge] clip-related VoiceEngine methods:", names.join(","));
+    for (const k of names) {
+      const orig = VoiceEngine[k];
+      if (/^(getSystemSteadyClockNowMs|setClipsPerfMonitoring)$/.test(k)) continue;
+      VoiceEngine[k] = function (...args) {
+        let a;
+        try { a = JSON.stringify(args.map((x) => (typeof x === "function" ? "[fn]" : x))).slice(0, 300); } catch { a = "?"; }
+        console.info("[clipsd-bridge] call", k, a);
+        return orig.apply(this, args);
+      };
+    }
   }
 
   // Convenience handle for DevTools debugging/verification.

@@ -301,7 +301,7 @@ impl Recorder {
 impl Service for Recorder {
     fn handle(&self, cmd: Command) -> Event {
         match cmd {
-            Command::StartRecording { fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id } => {
+            Command::StartRecording { fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id, .. } => {
                 self.start(fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id)
             }
             Command::StopRecording => self.stop(),

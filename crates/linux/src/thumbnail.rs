@@ -45,31 +45,7 @@ pub fn thumbnail_bytes_from_video(video: &Path, at_ms: u32, quality: u8) -> Resu
             continue;
         }
         if dec.receive_frame(&mut frame).is_ok() {
-            let sw = frame.width().max(1);
-            let sh = frame.height().max(1);
-            let dw = sw.min(640);
-            let dh = (sh * dw / sw).max(1);
-            let mut scaler = ffmpeg::software::scaling::Context::get(
-                frame.format(),
-                sw,
-                sh,
-                ffmpeg::format::Pixel::RGB24,
-                dw,
-                dh,
-                ffmpeg::software::scaling::Flags::BILINEAR,
-            )
-            .map_err(|e| format!("thumb swscale: {e}"))?;
-            let mut rgb = ffmpeg::util::frame::Video::empty();
-            scaler.run(&frame, &mut rgb).map_err(|e| format!("thumb scale: {e}"))?;
-            // Pack tightly in case stride > dw*3.
-            let stride = rgb.stride(0);
-            let row = (dw * 3) as usize;
-            let mut packed = Vec::with_capacity(row * dh as usize);
-            let src = rgb.data(0);
-            for y in 0..dh as usize {
-                packed.extend_from_slice(&src[y * stride..y * stride + row]);
-            }
-            return encode_rgb_jpeg(&packed, dw as u16, dh as u16, quality, None);
+            return frame_to_jpeg(&frame, 640, quality, None);
         }
     }
     Err("could not decode a video frame for thumbnail".into())
@@ -78,4 +54,64 @@ pub fn thumbnail_bytes_from_video(video: &Path, at_ms: u32, quality: u8) -> Resu
 pub fn thumbnail_from_video(video: &Path, at_ms: u32, out: &Path, quality: u8) -> Result<(), String> {
     let bytes = thumbnail_bytes_from_video(video, at_ms, quality)?;
     std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// Scale a decoded frame to at most `max_w` wide (aspect kept, never upscaled) and JPEG-encode it.
+pub fn frame_to_jpeg(
+    frame: &ffmpeg::util::frame::Video,
+    max_w: u32,
+    quality: u8,
+    comment: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let sw = frame.width().max(1);
+    let sh = frame.height().max(1);
+    let dw = sw.min(max_w) & !1;
+    let dh = ((sh as u64 * dw as u64 / sw as u64) as u32).max(1);
+    let mut scaler = ffmpeg::software::scaling::Context::get(
+        frame.format(),
+        sw,
+        sh,
+        ffmpeg::format::Pixel::RGB24,
+        dw,
+        dh,
+        ffmpeg::software::scaling::Flags::BILINEAR,
+    )
+    .map_err(|e| format!("swscale: {e}"))?;
+    let mut rgb = ffmpeg::util::frame::Video::empty();
+    scaler.run(frame, &mut rgb).map_err(|e| format!("scale: {e}"))?;
+    // Pack tightly in case stride > dw*3.
+    let stride = rgb.stride(0);
+    let row = (dw * 3) as usize;
+    let mut packed = Vec::with_capacity(row * dh as usize);
+    let src = rgb.data(0);
+    for y in 0..dh as usize {
+        packed.extend_from_slice(&src[y * stride..y * stride + row]);
+    }
+    encode_rgb_jpeg(&packed, dw as u16, dh as u16, quality, comment)
+}
+
+/// Decode any still image ffmpeg understands (the portal screenshot is a PNG) and re-encode it
+/// as a full-resolution JPEG carrying `comment` (Discord's JSON metadata) as a COM segment.
+pub fn jpeg_from_image_file(path: &Path, quality: u8, comment: &str) -> Result<Vec<u8>, String> {
+    ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
+    let mut ictx = ffmpeg::format::input(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let stream = ictx.streams().best(ffmpeg::media::Type::Video).ok_or("no image stream")?;
+    let idx = stream.index();
+    let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|e| format!("decoder ctx: {e}"))?;
+    let mut dec = ctx.decoder().video().map_err(|e| format!("image decoder: {e}"))?;
+    let mut frame = ffmpeg::util::frame::Video::empty();
+    for (s, pkt) in ictx.packets() {
+        if s.index() != idx || dec.send_packet(&pkt).is_err() {
+            continue;
+        }
+        if dec.receive_frame(&mut frame).is_ok() {
+            return frame_to_jpeg(&frame, u32::MAX, quality, Some(comment));
+        }
+    }
+    let _ = dec.send_eof();
+    if dec.receive_frame(&mut frame).is_ok() {
+        return frame_to_jpeg(&frame, u32::MAX, quality, Some(comment));
+    }
+    Err("could not decode screenshot image".into())
 }

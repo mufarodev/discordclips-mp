@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
-use ashpd::WindowIdentifier;
 
 /// Active portal ScreenCast handle. Keep `_session` alive for as long as PipeWire streams run.
 pub struct PortalStream {
@@ -18,6 +17,9 @@ pub struct PortalStream {
     pub width: Option<u32>,
     pub height: Option<u32>,
     _session: ashpd::desktop::Session<'static, Screencast<'static>>,
+    /// Keeps the D-Bus tasks (zbus runs on tokio here) alive for the whole session. Declared
+    /// after `_session` so the session is dropped first.
+    _rt: tokio::runtime::Runtime,
 }
 
 fn token_path() -> Option<PathBuf> {
@@ -42,12 +44,15 @@ fn save_restore_token(token: &str) {
 
 /// Request a ScreenCast stream via xdg-desktop-portal (blocking wrapper around a one-shot tokio rt).
 pub fn open_screencast() -> Result<PortalStream, String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Multi-thread (1 worker): the runtime must keep driving zbus after `block_on` returns,
+    // otherwise the portal session's D-Bus connection stalls and the stream dies.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
-    rt.block_on(async {
+    let portal = rt.block_on(async {
         // Leak the proxy for the lifetime of the session (one per recording; tiny allocation)
         // so `PortalStream` can own the `'static` Session handle cleanly.
         let proxy: &'static Screencast<'static> = Box::leak(Box::new(
@@ -59,11 +64,18 @@ pub fn open_screencast() -> Result<PortalStream, String> {
             .map_err(|e| format!("create_session: {e}"))?;
 
         let token = load_restore_token();
+        // Default to Monitor so restore tokens persist across game restarts and switches;
+        // set CLIPSD_SOURCE=window|any to opt into per-window portal selection.
+        let source_types = match std::env::var("CLIPSD_SOURCE").ok().as_deref() {
+            Some("window") => SourceType::Window.into(),
+            Some("any") => SourceType::Monitor | SourceType::Window,
+            _ => SourceType::Monitor.into(),
+        };
         proxy
             .select_sources(
                 &session,
                 CursorMode::Embedded,
-                SourceType::Monitor | SourceType::Window,
+                source_types,
                 false,
                 token.as_deref(),
                 PersistMode::ExplicitlyRevoked,
@@ -72,7 +84,7 @@ pub fn open_screencast() -> Result<PortalStream, String> {
             .map_err(|e| format!("select_sources: {e}"))?;
 
         let response = proxy
-            .start(&session, &WindowIdentifier::default())
+            .start(&session, None)
             .await
             .map_err(|e| format!("portal start: {e}"))?
             .response()
@@ -97,12 +109,15 @@ pub fn open_screencast() -> Result<PortalStream, String> {
             .await
             .map_err(|e| format!("open_pipe_wire_remote: {e}"))?;
 
-        Ok(PortalStream { pipewire_fd, node_id, width, height, _session: session })
+        Ok::<_, String>((pipewire_fd, node_id, width, height, session))
     })
+    .map(|(pipewire_fd, node_id, width, height, session)| PortalStream { pipewire_fd, node_id, width, height, _session: session, _rt: rt })?;
+    Ok(portal)
 }
 
 /// Take a non-interactive screenshot via xdg-desktop-portal (fallback when no frame is buffered).
-pub fn portal_screenshot_bytes() -> Result<Vec<u8>, String> {
+/// Returns the screenshot file path (a PNG owned by the caller, who must delete it).
+pub fn portal_screenshot_path() -> Result<std::path::PathBuf, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -121,8 +136,6 @@ pub fn portal_screenshot_bytes() -> Result<Vec<u8>, String> {
             .uri()
             .to_file_path()
             .map_err(|_| format!("non-file screenshot URI: {}", uri.uri()))?;
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let _ = std::fs::remove_file(&path);
-        Ok(bytes)
+        Ok(path)
     })
 }

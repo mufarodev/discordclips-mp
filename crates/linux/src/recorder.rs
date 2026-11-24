@@ -13,9 +13,10 @@ use clipsd_core::metadata::with_defaults;
 use clipsd_core::proto::{Command, Event, Stats};
 use clipsd_core::{mux, AudioConfig, AudioRing, CodecConfig, Encoder, Ring};
 
-use crate::capture::{CaptureConfig, PcmChunk, PwCapture};
+use crate::capture::{CaptureConfig, Frame, PcmChunk, PwCapture};
 use crate::encode::{EncoderConfig, FfmpegAacEncoder, FfmpegVideoEncoder};
 use crate::thumbnail;
+use crate::vk_capture::VkCapture;
 
 const AUDIO_BITRATE_BPS: u32 = 128_000;
 const THUMB_QUALITY: u8 = 80;
@@ -74,6 +75,7 @@ impl Recorder {
         startup_delay_ms: u32,
         width: Option<u32>,
         window_id: Option<u32>,
+        pid: Option<u32>,
     ) -> Event {
         let mut slot = self.session.lock().unwrap();
         if slot.is_some() {
@@ -82,7 +84,11 @@ impl Recorder {
         if startup_delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(startup_delay_ms as u64));
         }
-        match Self::spawn(fps.clamp(1, 120), duration_ms, bitrate_kbps.max(100), width, window_id) {
+        // Also decode synthetic Linux window handles (`0x70000000 + pid`) if explicit `pid` is unset.
+        let target_pid = pid.or_else(|| {
+            window_id.and_then(|w| ((w & 0xf000_0000) == 0x7000_0000).then_some(w & 0x0fff_ffff))
+        });
+        match Self::spawn(fps.clamp(1, 120), duration_ms, bitrate_kbps.max(100), width, window_id, target_pid) {
             Ok(s) => {
                 *slot = Some(s);
                 Event::RecordingEvent { state: "started".into() }
@@ -97,6 +103,7 @@ impl Recorder {
         bitrate_kbps: u32,
         max_width: Option<u32>,
         window_id: Option<u32>,
+        pid: Option<u32>,
     ) -> Result<Session, String> {
         let window_secs = duration_ms.div_ceil(1000).max(1);
         let state = Arc::new(Mutex::new(State {
@@ -118,10 +125,10 @@ impl Recorder {
             let (state, stop) = (state.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("clipsd-video".into())
-                .spawn(move || video_thread(fps, bitrate_kbps, max_width, window_id, state, stop, ctl_rx, init_tx))
+                .spawn(move || video_thread(fps, bitrate_kbps, max_width, window_id, pid, state, stop, ctl_rx, init_tx))
                 .map_err(|e| e.to_string())?
         };
-        let (width, height, audio_rx) = match init_rx.recv_timeout(Duration::from_secs(60)) {
+        let (width, height, audio_rx) = match init_rx.recv_timeout(Duration::from_secs(180)) {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 let _ = video.join();
@@ -289,8 +296,8 @@ impl Recorder {
 impl Service for Recorder {
     fn handle(&self, cmd: Command) -> Event {
         match cmd {
-            Command::StartRecording { fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id } => {
-                self.start(fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id)
+            Command::StartRecording { fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id, pid } => {
+                self.start(fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id, pid)
             }
             Command::StopRecording => self.stop(),
             Command::SetDuration { duration_ms } => match self.session.lock().unwrap().as_mut() {
@@ -321,14 +328,19 @@ impl Service for Recorder {
                     Err(message) => Event::Error { message },
                 }
             }
-            Command::TakeScreenshot { filepath, quality: _, metadata, .. } => {
+            Command::TakeScreenshot { filepath, quality, metadata, .. } => {
                 let path = Path::new(&filepath);
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let comment = with_defaults(metadata).to_string();
-                match crate::portal::portal_screenshot_bytes()
-                    .and_then(|raw| thumbnail::jpeg_with_comment(&raw, &comment))
+                let q = quality.clamp(1, 100) as u8;
+                match crate::portal::portal_screenshot_path()
+                    .and_then(|png| {
+                        let r = thumbnail::jpeg_from_image_file(&png, q, &comment);
+                        let _ = std::fs::remove_file(&png);
+                        r
+                    })
                     .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display())))
                 {
                     Ok(()) => Event::ScreenshotComplete { filepath },
@@ -344,12 +356,69 @@ impl Service for Recorder {
     }
 }
 
+enum CaptureBackend {
+    Vulkan(VkCapture),
+    PipeWire(PwCapture),
+}
+
+impl CaptureBackend {
+    fn width(&self) -> usize {
+        match self {
+            Self::Vulkan(v) => v.width,
+            Self::PipeWire(p) => p.width,
+        }
+    }
+    fn height(&self) -> usize {
+        match self {
+            Self::Vulkan(v) => v.height,
+            Self::PipeWire(p) => p.height,
+        }
+    }
+    fn is_dmabuf(&self) -> bool {
+        match self {
+            Self::Vulkan(_) => true,
+            Self::PipeWire(p) => p.is_dmabuf(),
+        }
+    }
+    fn flush_backlog(&mut self) {
+        match self {
+            Self::Vulkan(v) => v.flush_backlog(),
+            Self::PipeWire(p) => p.flush_backlog(),
+        }
+    }
+    fn take_audio(&mut self) -> Option<Receiver<PcmChunk>> {
+        match self {
+            Self::Vulkan(v) => v.take_audio(),
+            Self::PipeWire(p) => p.take_audio(),
+        }
+    }
+    fn poll_frame(&mut self, wait: Duration) -> Result<Option<(Frame, i64)>, String> {
+        match self {
+            Self::Vulkan(v) => v.poll_frame(wait),
+            Self::PipeWire(p) => p.poll_frame(wait),
+        }
+    }
+    fn dropped(&self) -> u64 {
+        match self {
+            Self::Vulkan(v) => v.dropped(),
+            Self::PipeWire(p) => p.dropped(),
+        }
+    }
+    fn dropped_audio(&self) -> u64 {
+        match self {
+            Self::Vulkan(v) => v.dropped_audio(),
+            Self::PipeWire(p) => p.dropped_audio(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn video_thread(
     fps: u32,
     bitrate_kbps: u32,
     max_width: Option<u32>,
     window_id: Option<u32>,
+    pid: Option<u32>,
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     ctl: Receiver<Ctl>,
@@ -361,16 +430,30 @@ fn video_thread(
         window_id,
         ..CaptureConfig::default()
     };
-    let mut cap = match PwCapture::start(&ccfg) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = init.send(Err(e));
-            return;
+    let mut cap = match VkCapture::try_start(&ccfg, pid) {
+        Some(Ok(vk)) => CaptureBackend::Vulkan(vk),
+        Some(Err(e)) => {
+            eprintln!("clipsd-linux: Vulkan layer attach failed ({e}); falling back to portal PipeWire");
+            match PwCapture::start(&ccfg) {
+                Ok(c) => CaptureBackend::PipeWire(c),
+                Err(pe) => {
+                    let _ = init.send(Err(pe));
+                    return;
+                }
+            }
         }
+        None => match PwCapture::start(&ccfg) {
+            Ok(c) => CaptureBackend::PipeWire(c),
+            Err(e) => {
+                let _ = init.send(Err(e));
+                return;
+            }
+        },
     };
-    let mut ecfg = EncoderConfig::new(cap.width, cap.height);
+    let mut ecfg = EncoderConfig::new(cap.width(), cap.height());
     ecfg.fps = fps as i32;
     ecfg.bitrate_bps = bitrate_kbps as i32 * 1000;
+    ecfg.prefer_cuda = cap.is_dmabuf();
     let mut enc = match FfmpegVideoEncoder::new(&ecfg) {
         Ok(e) => e,
         Err(e) => {
@@ -379,7 +462,7 @@ fn video_thread(
         }
     };
     cap.flush_backlog();
-    let _ = init.send(Ok((cap.width as u32, cap.height as u32, cap.take_audio())));
+    let _ = init.send(Ok((cap.width() as u32, cap.height() as u32, cap.take_audio())));
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(Ctl::SetBitrate(bps)) = ctl.try_recv() {

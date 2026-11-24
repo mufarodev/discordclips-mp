@@ -24,6 +24,10 @@ pub enum Command {
         /// Optional macOS CGWindowID to capture; falls back to main display if absent/not found.
         #[serde(default)]
         window_id: Option<u32>,
+        /// Optional target game PID (Linux: attaches directly to the implicit Vulkan capture layer
+        /// when available, falling back to xdg-desktop-portal PipeWire capture).
+        #[serde(default)]
+        pid: Option<u32>,
     },
     StopRecording,
     SetDuration { duration_ms: u32 },
@@ -152,6 +156,7 @@ mod tests {
                 startup_delay_ms: 0,
                 width: None,
                 window_id: None,
+                pid: None,
             },
             Command::SaveClip {
                 filepath: "/x.mp4".into(),
