@@ -32,3 +32,8 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [ ] `ExportVideoComposition` (recipe JSON → ffmpeg filter graph)
 - [ ] ML detection (ONNX Runtime, open model) → `MlDetection` events
 - [ ] Write-up / demo for Discord engineers
+
+## Open issues
+- **Intermittent startup hole in video**: in ~3 of ~16 fresh `clipsd start` runs, the first 1–2 s of the buffer had a 0.7–2.1 s gap between video frames (never seen later in a recording, never with 0 audio-packet drops affected). Root cause unknown. Ruled out: encoder frame drops (stat added; repeat test emits every frame), loop stalls (traced). Mitigations applied: SCK `queueDepth` 8, channel depth 2, separate audio dispatch queue, real frames never dropped. After those, 0 of ~9 runs reproduced. Diagnose with `CLIPSD_TRACE=1 clipsd start`.
+- A/V sync has not been verified by eye/ear (only timestamps).
+- TCC-denied error path untested; QuickTime not opened by eye (AVFoundation `isPlayable` only).

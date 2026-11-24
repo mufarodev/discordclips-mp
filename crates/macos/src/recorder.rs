@@ -322,6 +322,9 @@ fn video_thread(
         }
     };
     let _ = init.send(Ok((cap.width as u32, cap.height as u32, cap.take_audio())));
+    let trace = std::env::var_os("CLIPSD_TRACE").is_some();
+    let t_start = std::time::Instant::now();
+    let (mut last_poll, mut last_out) = (t_start, t_start);
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(c) = ctl.try_recv() {
@@ -333,6 +336,13 @@ fn video_thread(
                 }
             }
         }
+        if trace {
+            let now = std::time::Instant::now();
+            if now - last_poll > Duration::from_millis(150) {
+                eprintln!("[trace] {:?}: video loop stalled {:?} between polls", now - t_start, now - last_poll);
+            }
+            last_poll = now;
+        }
         let step = match cap.poll_frame(Duration::from_millis(100)) {
             Ok(Some((f, pts))) => enc.encode(f, pts).map(Some),
             Ok(None) => Ok(None),
@@ -340,6 +350,13 @@ fn video_thread(
         };
         match step {
             Ok(Some(pkts)) => {
+                if trace && !pkts.is_empty() {
+                    let now = std::time::Instant::now();
+                    if now - last_out > Duration::from_millis(150) {
+                        eprintln!("[trace] {:?}: encoder produced nothing for {:?}", now - t_start, now - last_out);
+                    }
+                    last_out = now;
+                }
                 let mut st = state.lock().unwrap();
                 if st.config.is_none() {
                     st.config = enc.codec_config();

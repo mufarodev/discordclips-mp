@@ -40,7 +40,7 @@ const SC_ERROR_USER_DECLINED: isize = -3801;
 const REPEAT_AFTER: Duration = Duration::from_millis(100);
 /// Minimum spacing between emitted frames (µs); keeps durations non-zero in the mp4.
 const MIN_FRAME_GAP_US: i64 = 5_000;
-const CHANNEL_DEPTH: usize = 4;
+const CHANNEL_DEPTH: usize = 2;
 /// ~10 ms chunks arrive 100/s; leave a couple of seconds of slack.
 const AUDIO_CHANNEL_DEPTH: usize = 256;
 
@@ -273,6 +273,7 @@ pub struct SckCapture {
     stream: Retained<SCStream>,
     _sink: Retained<FrameSink>,
     _queue: DispatchRetained<DispatchQueue>,
+    _audio_queue: DispatchRetained<DispatchQueue>,
     rx: Receiver<Item>,
     audio_rx: Option<Receiver<PcmChunk>>,
     /// Output size in pixels.
@@ -280,6 +281,10 @@ pub struct SckCapture {
     pub height: usize,
     last: Option<(CFRetained<CVPixelBuffer>, i64, Instant)>,
     last_emitted_us: i64,
+    trace: bool,
+    t0: Instant,
+    last_real_pts: i64,
+    repeats: u64,
 }
 
 fn fetch_display() -> Result<Retained<SCDisplay>, CaptureError> {
@@ -332,7 +337,9 @@ impl SckCapture {
                 flags: CMTimeFlags::Valid,
                 epoch: 0,
             });
-            conf.setQueueDepth(5);
+            // SCK renders into a pool of this many IOSurfaces; every frame we hold (channel, repeat
+            // buffer, encoder) is one it can't reuse, so keep the pool larger than what we hold.
+            conf.setQueueDepth(8);
             conf.setShowsCursor(true);
             conf.setScalesToFit(true);
             if cfg.audio {
@@ -346,7 +353,8 @@ impl SckCapture {
         let (tx, rx) = mpsc::sync_channel(CHANNEL_DEPTH);
         let (atx, arx) = mpsc::sync_channel(AUDIO_CHANNEL_DEPTH);
         let sink = FrameSink::new(tx, atx);
-        let queue = DispatchQueue::new("clipsd.capture", None);
+        let queue = DispatchQueue::new("clipsd.capture.video", None);
+        let audio_queue = DispatchQueue::new("clipsd.capture.audio", None);
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &conf, None) };
         unsafe {
             stream
@@ -364,7 +372,7 @@ impl SckCapture {
                     .addStreamOutput_type_sampleHandlerQueue_error(
                         ProtocolObject::from_ref(&*sink),
                         SCStreamOutputType::Audio,
-                        Some(&queue),
+                        Some(&audio_queue),
                     )
                     .map_err(|e| map_error("addStreamOutput(audio)", &e))?;
             }
@@ -381,7 +389,7 @@ impl SckCapture {
             Err(_) => return Err(CaptureError::Sck("timed out starting capture".into())),
         }
 
-        Ok(Self { stream, _sink: sink, _queue: queue, rx, audio_rx: cfg.audio.then_some(arx), width, height, last: None, last_emitted_us: i64::MIN })
+        Ok(Self { stream, _sink: sink, _queue: queue, _audio_queue: audio_queue, rx, audio_rx: cfg.audio.then_some(arx), width, height, last: None, last_emitted_us: i64::MIN, trace: std::env::var_os("CLIPSD_TRACE").is_some(), t0: Instant::now(), last_real_pts: 0, repeats: 0 })
     }
 
     /// Take the audio chunk receiver (once). `None` if audio capture is off or already taken.
@@ -423,6 +431,14 @@ impl SckCapture {
                     // Never drop a real frame (it may be the last change before a static
                     // stretch). A repeat may have run slightly ahead of SCK's clock, so nudge the
                     // timestamp forward instead to keep pts strictly increasing.
+                    if self.trace {
+                        let wall = self.t0.elapsed().as_micros() as i64;
+                        let jump = item.pts_us - self.last_real_pts;
+                        if self.last_real_pts != 0 && !(0..150_000).contains(&jump) {
+                            eprintln!("[trace] wall={}ms real pts jump {}ms (emitted-ahead={}ms)", wall / 1000, jump / 1000, (self.last_emitted_us - item.pts_us) / 1000);
+                        }
+                        self.last_real_pts = item.pts_us;
+                    }
                     let pts_us = item.pts_us.max(self.last_emitted_us.saturating_add(MIN_FRAME_GAP_US));
                     self.last = Some((item.frame.0.clone(), pts_us, Instant::now()));
                     self.last_emitted_us = pts_us;
@@ -430,6 +446,12 @@ impl SckCapture {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some((buf, pts, at)) = &self.last {
+                        if self.trace {
+                            self.repeats += 1;
+                            if self.repeats == 1 || self.repeats % 20 == 0 {
+                                eprintln!("[trace] wall={}ms repeat #{} (screen static or SCK stalled)", self.t0.elapsed().as_millis(), self.repeats);
+                            }
+                        }
                         let pts_us = (pts + at.elapsed().as_micros() as i64).max(self.last_emitted_us.saturating_add(MIN_FRAME_GAP_US));
                         self.last_emitted_us = pts_us;
                         return Ok(Some((Frame(buf.clone()), pts_us)));
