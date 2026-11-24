@@ -9,13 +9,13 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [x] **M1 Capture**: ScreenCaptureKit stream (display first, window/app filter later) logs frame count + pts. Handles Screen Recording permission (TCC) failure with a clear error.
 - [x] **M2 Encode**: `VTCompressionSession` H.264, real-time, fixed keyframe interval (2s), outputs AVCC `Packet`s with correct `keyframe` flag + SPS/PPS from the format description.
 - [x] **M3 Save**: `Ring` + `save(last N s)` → playable `.mp4` (pure-Rust `mp4` crate). First demo. Verify in QuickTime and `ffprobe`.
-- [ ] **M3b** Thumbnail from first keyframe.
-- [~] CLI: `clipsd start | save <secs> | stop` done; `screenshot` todo (`start`/`save`/`stop` talk over a minimal line protocol on `$TMPDIR/clipsd.sock`, replaced by the M5 vocabulary)
+- [x] **M3b** Thumbnail (AVAssetImageGenerator → JPEG) at `thumbnail_ms`.
+- [x] CLI: `clipsd start | save <secs> | stop | stats | screenshot | send` (see PROTOCOL.md)
 
 ## Phase 2 — Audio + protocol
 - [x] **M4 Audio** (A/V sync by ear/visual check still TODO): ScreenCaptureKit system/app audio PCM → AAC-LC (AudioToolbox) → second mp4 track; A/V sync check.
-- [ ] **M5 IPC**: Unix-socket server with the Windows command/event vocabulary (see REFERENCE.md): StartRecording, StopRecording, SetDuration, SetBitrate, SaveClip, TakeScreenshot, GetStats, Shutdown ↔ ClipSaved, ClipSaveFailed, Stats, Error.
-- [ ] Live bitrate change without restarting the session.
+- [x] **M5 IPC** (PROTOCOL.md): Unix-socket server with the Windows command/event vocabulary (see REFERENCE.md): StartRecording, StopRecording, SetDuration, SetBitrate, SaveClip, TakeScreenshot, GetStats, Shutdown ↔ ClipSaved, ClipSaveFailed, Stats, Error.
+- [x] Live bitrate change without restarting the session.
 
 ## Phase 3 — Linux
 - [ ] **M6 Capture**: xdg-desktop-portal ScreenCast → PipeWire (`ashpd` + `pipewire-rs`), DMA-BUF frames, restore token.

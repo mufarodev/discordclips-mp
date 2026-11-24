@@ -407,35 +407,86 @@ impl SckCapture {
     }
 }
 
-impl Capture for SckCapture {
-    type Frame = Frame;
-
-    /// Blocks until a frame is available. Real frames keep SCK's host-clock pts; if the screen
-    /// is static for `REPEAT_AFTER`, the last frame is repeated with an advanced pts. pts is
-    /// strictly increasing.
-    fn next_frame(&mut self) -> Result<(Frame, i64), String> {
+impl SckCapture {
+    /// Wait up to `wait` for a frame. Real frames keep SCK's host-clock pts; if the screen is
+    /// static for `REPEAT_AFTER`, the last frame is repeated with an advanced pts. pts is
+    /// strictly increasing. Returns `Ok(None)` if nothing is available yet (no frame has ever
+    /// arrived, or `wait` elapsed).
+    pub fn poll_frame(&mut self, wait: Duration) -> Result<Option<(Frame, i64)>, String> {
+        let deadline = Instant::now() + wait;
         loop {
-            match self.rx.recv_timeout(REPEAT_AFTER) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left.min(REPEAT_AFTER)) {
                 Ok(item) => {
                     if item.pts_us <= self.last_emitted_us {
                         continue; // keep pts strictly monotonic (a repeat may have run ahead)
                     }
                     self.last = Some((item.frame.0.clone(), item.pts_us, Instant::now()));
                     self.last_emitted_us = item.pts_us;
-                    return Ok((item.frame, item.pts_us));
+                    return Ok(Some((item.frame, item.pts_us)));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some((buf, pts, at)) = &self.last {
                         let pts_us = (pts + at.elapsed().as_micros() as i64).max(self.last_emitted_us + 1);
                         self.last_emitted_us = pts_us;
-                        return Ok((Frame(buf.clone()), pts_us));
+                        return Ok(Some((Frame(buf.clone()), pts_us)));
                     }
-                    // nothing captured yet: keep waiting
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => return Err("capture stream closed".into()),
             }
         }
     }
+}
+
+impl Capture for SckCapture {
+    type Frame = Frame;
+
+    /// Blocks until a frame is available.
+    fn next_frame(&mut self) -> Result<(Frame, i64), String> {
+        loop {
+            if let Some(f) = self.poll_frame(Duration::from_secs(1))? {
+                return Ok(f);
+            }
+        }
+    }
+}
+
+/// One-shot screenshot of the main display (macOS 14+), full resolution.
+pub fn screenshot_main_display() -> Result<CFRetained<objc2_core_graphics::CGImage>, CaptureError> {
+    use objc2_core_graphics::CGImage;
+    use objc2_screen_capture_kit::SCScreenshotManager;
+    let display = fetch_display()?;
+    let excluded = NSArray::new();
+    let filter = unsafe {
+        SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &excluded)
+    };
+    let conf = unsafe { SCStreamConfiguration::new() };
+    unsafe {
+        conf.setWidth(display.width() as usize * 2);
+        conf.setHeight(display.height() as usize * 2);
+        conf.setShowsCursor(true);
+    }
+    let (tx, rx) = mpsc::channel::<Result<CFRetained<CGImage>, CaptureError>>();
+    let block = RcBlock::new(move |img: *mut CGImage, err: *mut NSError| {
+        let r = unsafe {
+            if let Some(e) = err.as_ref() {
+                Err(map_error("screenshot", e))
+            } else if let Some(i) = NonNull::new(img) {
+                Ok(CFRetained::retain(i))
+            } else {
+                Err(CaptureError::Sck("empty screenshot".into()))
+            }
+        };
+        let _ = tx.send(r);
+    });
+    unsafe {
+        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(&filter, &conf, Some(&block))
+    };
+    rx.recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|_| Err(CaptureError::Sck("timed out taking screenshot".into())))
 }
 
 impl Drop for SckCapture {

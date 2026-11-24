@@ -48,6 +48,12 @@ impl AudioRing {
     pub fn new(window_secs: u32) -> Self {
         Self { window_us: window_secs as i64 * 1_000_000, pkts: VecDeque::new() }
     }
+    pub fn set_window(&mut self, window_secs: u32) {
+        self.window_us = window_secs as i64 * 1_000_000;
+    }
+    pub fn len(&self) -> usize {
+        self.pkts.len()
+    }
     pub fn push(&mut self, p: Packet) {
         self.pkts.push_back(p);
         let newest = self.pkts.back().unwrap().pts_us;
@@ -102,10 +108,33 @@ impl Ring {
         }
     }
 
+    /// Change the retention window; takes effect on the next `push`.
+    pub fn set_window(&mut self, window_secs: u32) {
+        self.window_us = window_secs as i64 * 1_000_000;
+    }
+
+    /// Time span currently buffered (newest pts - oldest pts).
+    pub fn buffered_us(&self) -> i64 {
+        match (self.pkts.front(), self.pkts.back()) {
+            (Some(a), Some(b)) => b.pts_us - a.pts_us,
+            _ => 0,
+        }
+    }
+
+    /// Total encoded bytes held.
+    pub fn bytes(&self) -> usize {
+        self.pkts.iter().map(|p| p.data.len()).sum()
+    }
+
     /// Last `secs` of video, starting at the keyframe at-or-before the cutoff (so >= `secs`).
     pub fn snapshot(&self, secs: u32) -> Vec<Packet> {
+        self.snapshot_us(secs as i64 * 1_000_000)
+    }
+
+    /// Like [`snapshot`](Self::snapshot) with microsecond precision.
+    pub fn snapshot_us(&self, keep_us: i64) -> Vec<Packet> {
         let Some(newest) = self.pkts.back() else { return vec![] };
-        let cutoff = newest.pts_us - secs as i64 * 1_000_000;
+        let cutoff = newest.pts_us - keep_us;
         let start = self.pkts.iter().rposition(|p| p.keyframe && p.pts_us <= cutoff).unwrap_or(0);
         self.pkts.iter().skip(start).cloned().collect()
     }
@@ -143,6 +172,10 @@ mod tests {
         assert!(r.snapshot(5).is_empty());
     }
 }
+
+pub mod proto;
+#[cfg(unix)]
+pub mod ipc;
 
 pub mod mux {
     //! MP4 muxing (pure Rust, `mp4` crate). Runs at save time only.

@@ -196,6 +196,11 @@ impl VtEncoder {
         Ok(Self { session, shared, refcon, width: cfg.width, height: cfg.height })
     }
 
+    /// Change the target bitrate on the running session (no restart, no keyframe).
+    pub fn set_bitrate(&mut self, bitrate_bps: i32) -> Result<(), String> {
+        set_prop(&self.session, unsafe { kVTCompressionPropertyKey_AverageBitRate }, &CFNumber::new_i32(bitrate_bps))
+    }
+
     pub fn size(&self) -> (usize, usize) {
         (self.width, self.height)
     }

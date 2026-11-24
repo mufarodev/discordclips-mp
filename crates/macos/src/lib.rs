@@ -4,3 +4,5 @@
 pub mod capture;
 pub mod encode;
 pub mod aac;
+pub mod thumbnail;
+pub mod recorder;
