@@ -1,0 +1,18 @@
+[package]
+name = "clipsd-macos"
+version = "0.0.0"
+edition = "2021"
+
+# Everything below is macOS-only; the crate compiles to an empty lib elsewhere so that
+# `cargo test` at the workspace root keeps working on Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+clipsd-core = { path = "../core" }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-video-toolbox = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
