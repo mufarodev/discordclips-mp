@@ -46,6 +46,8 @@ struct Shared {
     ready: Mutex<Vec<Packet>>,
     config: Mutex<Option<CodecConfig>>,
     error: Mutex<Option<String>>,
+    /// Frames VideoToolbox reported as dropped (NULL sample buffer in the callback).
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 pub struct VtEncoder {
@@ -85,7 +87,10 @@ unsafe extern "C-unwind" fn output_cb(
         return;
     }
     // NULL sample buffer == frame dropped by the encoder.
-    let Some(sb) = sb.as_ref() else { return };
+    let Some(sb) = sb.as_ref() else {
+        shared.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
     if let Err(e) = handle_sample(shared, sb) {
         *shared.error.lock().unwrap() = Some(e);
     }
@@ -199,6 +204,11 @@ impl VtEncoder {
     /// Change the target bitrate on the running session (no restart, no keyframe).
     pub fn set_bitrate(&mut self, bitrate_bps: i32) -> Result<(), String> {
         set_prop(&self.session, unsafe { kVTCompressionPropertyKey_AverageBitRate }, &CFNumber::new_i32(bitrate_bps))
+    }
+
+    /// Frames the encoder dropped (real-time mode may drop under load).
+    pub fn dropped(&self) -> u64 {
+        self.shared.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn size(&self) -> (usize, usize) {

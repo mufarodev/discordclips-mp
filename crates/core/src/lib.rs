@@ -192,17 +192,34 @@ pub mod mux {
     /// and the writer emits no edit list). Each sample's duration is the gap to the next one;
     /// the last sample reuses the previous gap.
     pub fn write_mp4<W: Write + Seek>(w: W, cfg: &CodecConfig, packets: &[Packet]) -> Result<(), String> {
-        write_mp4_av(w, cfg, packets, None)
+        write_mp4_av(w, cfg, packets, None, None)
+    }
+
+    /// UUID identifying a Discord-format clip in its top-level `uuid` box (interface note, see
+    /// REFERENCE.md). The client rejects `.mp4` files without this box.
+    pub const DISCORD_UUID: [u8; 16] =
+        [0xa1, 0xc8, 0x52, 0x99, 0x33, 0x46, 0x4d, 0xb8, 0x88, 0xf0, 0x83, 0xf5, 0x7a, 0x75, 0xa5, 0xef];
+
+    /// A top-level `uuid` box: size(4) "uuid"(4) UUID(16) then the JSON metadata bytes.
+    pub fn discord_uuid_box(metadata_json: &[u8]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(24 + metadata_json.len());
+        b.extend_from_slice(&((24 + metadata_json.len()) as u32).to_be_bytes());
+        b.extend_from_slice(b"uuid");
+        b.extend_from_slice(&DISCORD_UUID);
+        b.extend_from_slice(metadata_json);
+        b
     }
 
     /// Like [`write_mp4`], plus an optional AAC-LC audio track. Audio packets are placed on the
     /// same (rebased) timeline as the video; those ending before the first video sample are
-    /// dropped. Samples are written interleaved by time.
+    /// dropped. Samples are written interleaved by time. If `discord_metadata` (JSON bytes) is
+    /// given, a Discord `uuid` box carrying it is appended as the last top-level box.
     pub fn write_mp4_av<W: Write + Seek>(
         w: W,
         cfg: &CodecConfig,
         packets: &[Packet],
         audio: Option<(&AudioConfig, &[Packet])>,
+        discord_metadata: Option<&[u8]>,
     ) -> Result<(), String> {
         use mp4::{
             AacConfig, AudioObjectType, AvcConfig, ChannelConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample,
@@ -323,7 +340,37 @@ pub mod mux {
         for (_, track, sample) in &items {
             mw.write_sample(*track, sample).map_err(e)?;
         }
-        mw.write_end().map_err(e)
+        mw.write_end().map_err(e)?;
+        if let Some(json) = discord_metadata {
+            let mut w = mw.into_writer();
+            w.write_all(&discord_uuid_box(json)).map_err(|e| e.to_string())?;
+            w.flush().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Mirror of the client's clip check (interface notes): `ftypisom` signature, then walk the
+    /// top-level boxes (32-bit sizes, >= 8) until the Discord `uuid` box; returns its JSON body.
+    /// Each box position must have 24 readable bytes, as the client reads a 24-byte header there.
+    pub fn read_discord_metadata(file: &[u8]) -> Result<Vec<u8>, String> {
+        if file.len() < 24 || &file[4..12] != b"ftypisom" {
+            return Err("not-mp4-signature".into());
+        }
+        let mut i = u32::from_be_bytes(file[0..4].try_into().unwrap()) as usize;
+        while i < file.len() {
+            if i + 24 > file.len() {
+                return Err("short read".into());
+            }
+            let size = u32::from_be_bytes(file[i..i + 4].try_into().unwrap()) as usize;
+            if size < 8 {
+                return Err("malformed-box".into());
+            }
+            if &file[i + 4..i + 8] == b"uuid" && file[i + 8..i + 24] == DISCORD_UUID {
+                return Ok(file[i + 24..(i + size).min(file.len())].to_vec());
+            }
+            i += size;
+        }
+        Err("no-discord-uuid-box".into())
     }
 
     #[cfg(test)]
@@ -370,7 +417,10 @@ pub mod mux {
                 .map(|i| Packet { pts_us: base - 100_000 + i * frame_us, keyframe: true, data: vec![0x21, i as u8, 0, 0] })
                 .collect();
             let mut buf = std::io::Cursor::new(Vec::new());
-            write_mp4_av(&mut buf, &cfg, &vid, Some((&ac, &aud))).unwrap();
+            write_mp4_av(&mut buf, &cfg, &vid, Some((&ac, &aud)), Some(br#"{"game":"x"}"#)).unwrap();
+            let bytes = buf.get_ref().clone();
+            assert_eq!(read_discord_metadata(&bytes).unwrap(), br#"{"game":"x"}"#);
+            // still a valid MP4 for the standard reader with the trailing box present
             let len = buf.get_ref().len() as u64;
             buf.set_position(0);
             let r = mp4::Mp4Reader::read_header(buf, len).unwrap();
@@ -379,6 +429,15 @@ pub mod mux {
             assert!(a.sample_count() > 80 && a.sample_count() < 100, "audio samples {}", a.sample_count());
             let v = r.tracks().values().find(|t| t.track_type().unwrap() == mp4::TrackType::Video).unwrap();
             assert_eq!(v.sample_count(), 60);
+        }
+
+        #[test]
+        fn plain_mp4_has_no_discord_box() {
+            let cfg = CodecConfig { width: 64, height: 64, sps: vec![0x67, 0x64, 0, 0x28], pps: vec![0x68] };
+            let pk = [Packet { pts_us: 0, keyframe: true, data: vec![0, 0, 0, 1, 0x65] }];
+            let mut buf = std::io::Cursor::new(Vec::new());
+            write_mp4(&mut buf, &cfg, &pk).unwrap();
+            assert_eq!(read_discord_metadata(buf.get_ref()).unwrap_err(), "no-discord-uuid-box");
         }
 
         #[test]

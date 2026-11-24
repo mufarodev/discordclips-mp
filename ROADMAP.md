@@ -5,7 +5,7 @@ Legend: [ ] todo · [~] in progress · [x] done
 ## Phase 0 — Scaffold
 - [x] Workspace + `clipsd-core` (traits `Capture`/`Encoder`, GOP-aligned `Ring`, tests)
 
-## Phase 1 — macOS standalone (video only)
+## Phase 1 — macOS standalone (video + audio, protocol, Discord-format clips)
 - [x] **M1 Capture**: ScreenCaptureKit stream (display first, window/app filter later) logs frame count + pts. Handles Screen Recording permission (TCC) failure with a clear error.
 - [x] **M2 Encode**: `VTCompressionSession` H.264, real-time, fixed keyframe interval (2s), outputs AVCC `Packet`s with correct `keyframe` flag + SPS/PPS from the format description.
 - [x] **M3 Save**: `Ring` + `save(last N s)` → playable `.mp4` (pure-Rust `mp4` crate). First demo. Verify in QuickTime and `ffprobe`.
@@ -24,9 +24,9 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [ ] Same `core` + protocol, no changes expected. Any change to `core` here is a design bug to log.
 
 ## Phase 4 — Discord integration (research-gated, see INTEGRATION.md)
-- [ ] **M9** Find how `discord_desktop_core` + renderer drive the clips module and what gates it by platform.
-- [ ] **M10** macOS `discord_clips.node` shim exposing `getModulePath` + `clipsd` binary as the worker, in a *copy* of the app.
-- [ ] **M11** Prove one clip saved from inside the patched client.
+- [x] **M9** Research done — see INTEGRATION.md. The macOS client has the clip *file* plumbing; the recording-control path is stubbed in closed native code ("clips not supported in this build").
+- [ ] (blocked — needs a decision, see INTEGRATION.md) **M10** macOS `discord_clips.node` shim exposing `getModulePath` + `clipsd` binary as the worker, in a *copy* of the app.
+- [ ] (blocked) **M11** Prove one clip saved from inside the patched client.
 
 ## Phase 5 (optional)
 - [ ] `ExportVideoComposition` (recipe JSON → ffmpeg filter graph)

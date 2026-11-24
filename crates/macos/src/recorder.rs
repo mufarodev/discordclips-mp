@@ -213,7 +213,9 @@ impl Recorder {
         };
         let audio_ref = audio.as_ref().filter(|(_, a)| !a.is_empty()).map(|(c, a)| (c, a.as_slice()));
         let audio_packets = audio_ref.map_or(0, |(_, a)| a.len());
-        if let Err(e) = mux::write_mp4_av(std::io::BufWriter::new(file), &cfg, &pkts, audio_ref) {
+        // Every clip carries the Discord `uuid` box; hosts own the metadata schema (default `{}`).
+        let meta = metadata.as_ref().map(|m| m.to_string()).unwrap_or_else(|| "{}".into());
+        if let Err(e) = mux::write_mp4_av(std::io::BufWriter::new(file), &cfg, &pkts, audio_ref, Some(meta.as_bytes())) {
             let _ = std::fs::remove_file(&tmp);
             return fail(e);
         }
@@ -343,7 +345,7 @@ fn video_thread(
                     st.config = enc.codec_config();
                 }
                 st.frames += 1;
-                st.dropped = cap.dropped();
+                st.dropped = cap.dropped() + enc.dropped();
                 st.audio_dropped = cap.dropped_audio();
                 for p in pkts {
                     st.ring.push(p);

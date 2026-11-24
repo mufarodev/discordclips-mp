@@ -38,6 +38,8 @@ const PIXEL_FORMAT_420V: u32 = 0x3432_3076;
 /// `SCStreamErrorUserDeclined`.
 const SC_ERROR_USER_DECLINED: isize = -3801;
 const REPEAT_AFTER: Duration = Duration::from_millis(100);
+/// Minimum spacing between emitted frames (µs); keeps durations non-zero in the mp4.
+const MIN_FRAME_GAP_US: i64 = 5_000;
 const CHANNEL_DEPTH: usize = 4;
 /// ~10 ms chunks arrive 100/s; leave a couple of seconds of slack.
 const AUDIO_CHANNEL_DEPTH: usize = 256;
@@ -418,16 +420,17 @@ impl SckCapture {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left.min(REPEAT_AFTER)) {
                 Ok(item) => {
-                    if item.pts_us <= self.last_emitted_us {
-                        continue; // keep pts strictly monotonic (a repeat may have run ahead)
-                    }
-                    self.last = Some((item.frame.0.clone(), item.pts_us, Instant::now()));
-                    self.last_emitted_us = item.pts_us;
-                    return Ok(Some((item.frame, item.pts_us)));
+                    // Never drop a real frame (it may be the last change before a static
+                    // stretch). A repeat may have run slightly ahead of SCK's clock, so nudge the
+                    // timestamp forward instead to keep pts strictly increasing.
+                    let pts_us = item.pts_us.max(self.last_emitted_us.saturating_add(MIN_FRAME_GAP_US));
+                    self.last = Some((item.frame.0.clone(), pts_us, Instant::now()));
+                    self.last_emitted_us = pts_us;
+                    return Ok(Some((item.frame, pts_us)));
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some((buf, pts, at)) = &self.last {
-                        let pts_us = (pts + at.elapsed().as_micros() as i64).max(self.last_emitted_us + 1);
+                        let pts_us = (pts + at.elapsed().as_micros() as i64).max(self.last_emitted_us.saturating_add(MIN_FRAME_GAP_US));
                         self.last_emitted_us = pts_us;
                         return Ok(Some((Frame(buf.clone()), pts_us)));
                     }
