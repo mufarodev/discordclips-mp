@@ -105,3 +105,112 @@ mod tests {
         assert!(r.snapshot(5).is_empty());
     }
 }
+
+pub mod mux {
+    //! MP4 muxing (pure Rust, `mp4` crate). Runs at save time only.
+    use super::{CodecConfig, Packet};
+    use std::io::{Seek, Write};
+
+    /// Media timescale for the video track.
+    const TIMESCALE: u32 = 90_000;
+
+    /// Write `packets` (as returned by `Ring::snapshot`, so starting on a keyframe) as an MP4
+    /// with one H.264 track. AVCC packet bytes pass through unchanged; SPS/PPS go in `avcC`.
+    ///
+    /// Timestamps are rebased so the first sample is at 0 (capture pts are host-clock values
+    /// and the writer emits no edit list). Each sample's duration is the gap to the next one;
+    /// the last sample reuses the previous gap.
+    pub fn write_mp4<W: Write + Seek>(w: W, cfg: &CodecConfig, packets: &[Packet]) -> Result<(), String> {
+        use mp4::{AvcConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType};
+
+        let first = packets.first().ok_or("no packets to write")?;
+        if !first.keyframe {
+            return Err("first packet must be a keyframe".into());
+        }
+        if cfg.sps.len() < 4 || cfg.pps.is_empty() {
+            return Err("codec config missing SPS/PPS".into());
+        }
+        let e = |e: mp4::Error| e.to_string();
+
+        let mut mw = Mp4Writer::write_start(
+            w,
+            &Mp4Config {
+                major_brand: FourCC { value: *b"isom" },
+                minor_version: 512,
+                compatible_brands: [*b"isom", *b"iso2", *b"avc1", *b"mp41"].map(|value| FourCC { value }).to_vec(),
+                timescale: 1000,
+            },
+        )
+        .map_err(e)?;
+        mw.add_track(&TrackConfig {
+            track_type: TrackType::Video,
+            timescale: TIMESCALE,
+            language: "und".into(),
+            media_conf: MediaConfig::AvcConfig(AvcConfig {
+                width: cfg.width as u16,
+                height: cfg.height as u16,
+                seq_param_set: cfg.sps.clone(),
+                pic_param_set: cfg.pps.clone(),
+            }),
+        })
+        .map_err(e)?;
+
+        let ticks = |p: &Packet| ((p.pts_us - first.pts_us) as i128 * TIMESCALE as i128 / 1_000_000) as u64;
+        let mut prev_dur = (TIMESCALE / 30) as u32;
+        for (i, p) in packets.iter().enumerate() {
+            let start = ticks(p);
+            let duration = match packets.get(i + 1) {
+                Some(n) => (ticks(n).saturating_sub(start)).max(1) as u32,
+                None => prev_dur,
+            };
+            prev_dur = duration;
+            mw.write_sample(
+                1,
+                &Mp4Sample {
+                    start_time: start,
+                    duration,
+                    rendering_offset: 0,
+                    is_sync: p.keyframe,
+                    bytes: bytes::Bytes::copy_from_slice(&p.data),
+                },
+            )
+            .map_err(e)?;
+        }
+        mw.write_end().map_err(e)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn roundtrip_samples_sync_flags_and_rebased_times() {
+            let cfg = CodecConfig { width: 640, height: 480, sps: vec![0x67, 0x64, 0x00, 0x28, 0xac], pps: vec![0x68, 0xee, 0x3c, 0x80] };
+            let base = 499_140_000_000i64; // host-clock-sized pts
+            let pk: Vec<Packet> = (0..90)
+                .map(|i| Packet { pts_us: base + i * 33_333, keyframe: i % 60 == 0, data: vec![0, 0, 0, 2, 0x65, i as u8] })
+                .collect();
+            let mut buf = std::io::Cursor::new(Vec::new());
+            write_mp4(&mut buf, &cfg, &pk).unwrap();
+            let len = buf.get_ref().len() as u64;
+            buf.set_position(0);
+            let mut r = mp4::Mp4Reader::read_header(buf, len).unwrap();
+            let (&id, track) = r.tracks().iter().next().unwrap();
+            assert_eq!(track.width(), 640);
+            assert_eq!(track.sample_count(), 90);
+            let s0 = r.read_sample(id, 1).unwrap().unwrap();
+            assert!(s0.is_sync && s0.start_time == 0);
+            assert!(!r.read_sample(id, 2).unwrap().unwrap().is_sync);
+            assert!(r.read_sample(id, 61).unwrap().unwrap().is_sync);
+            let d = r.tracks()[&id].duration().as_secs_f64();
+            assert!((d - 90.0 * 0.033333).abs() < 0.05, "duration {d}");
+        }
+
+        #[test]
+        fn rejects_non_keyframe_start() {
+            let cfg = CodecConfig { width: 2, height: 2, sps: vec![0x67, 0x64, 0, 0x28], pps: vec![0x68] };
+            let pk = [Packet { pts_us: 0, keyframe: false, data: vec![] }];
+            assert!(write_mp4(std::io::Cursor::new(Vec::new()), &cfg, &pk).is_err());
+        }
+    }
+}

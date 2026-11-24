@@ -2,3 +2,7 @@
 name = "clipsd-core"
 version = "0.0.0"
 edition = "2021"
+
+[dependencies]
+mp4 = "0.14"
+bytes = "1"
