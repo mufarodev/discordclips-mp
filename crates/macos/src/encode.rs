@@ -133,7 +133,7 @@ unsafe fn handle_sample(shared: &Shared, sb: &CMSampleBuffer) -> Result<(), Stri
         let mut cfg = shared.config.lock().unwrap();
         // Keep the first config; a mid-stream change would need a new track (not supported yet).
         if cfg.is_none() {
-            *cfg = Some(CodecConfig { width: dims.width as u32, height: dims.height as u32, sps, pps });
+            *cfg = Some(CodecConfig::h264(dims.width as u32, dims.height as u32, sps, pps));
         }
     }
 

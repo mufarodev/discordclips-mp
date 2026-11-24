@@ -9,12 +9,13 @@ Spoken over a Unix socket (macOS/Linux). Vocabulary follows REFERENCE.md; the tr
 ## Commands → reply
 | Command | Fields | Reply |
 |---|---|---|
-| `StartRecording` | `fps`, `duration_ms` (retained window), `bitrate_kbps`, `startup_delay_ms?` | `RecordingEvent{state:"started"}` · `InitFailure{message}` (permission, encoder…) · `Error` if already recording |
+| `StartRecording` | `fps`, `duration_ms` (retained window), `bitrate_kbps`, `startup_delay_ms?`, `width?`, `window_id?` | `RecordingEvent{state:"started"}` · `InitFailure{message}` (permission, encoder…) · `Error` if already recording |
 | `StopRecording` | | `RecordingEvent{state:"stopped"}` |
 | `SetDuration` | `duration_ms` | `Ack` |
 | `SetBitrate` | `bitrate_kbps` (applied live, no restart) | `Ack` |
-| `SaveClip` | `filepath`, `metadata?` (echoed), `trim_start_ms?`, `trim_end_ms?`, `thumbnail_ms?`, `saved_at?`, `last_ms?` (extension: only the newest N ms) | `ClipSaved{filepath,duration_ms,stats_json,thumbnail,metadata}` · `ClipSaveFailed{filepath,error}` |
-| `TakeScreenshot` | `filepath`, `quality` (1–100) | `ScreenshotComplete{filepath}` · `Error` |
+| `SaveClip` | `filepath`, `metadata?` (echoed), `trim_start_ms?`, `trim_end_ms?`, `thumbnail_ms?`, `saved_at?`, `last_ms?` (extension: only the newest N ms), `embed_thumbnail?` (when true, returns `data:image/jpeg;base64,…` and updates the MP4 `uuid` box instead of writing `<clip>.jpg`) | `ClipSaved{filepath,duration_ms,stats_json,thumbnail,metadata}` · `ClipSaveFailed{filepath,error}` |
+| `UpdateClipMetadata` | `filepath`, `metadata` (JSON object replacing the MP4 `uuid` box) | `Ack` · `Error` |
+| `TakeScreenshot` | `filepath`, `quality` (1–100), `metadata?` (JSON written into the JPEG COM comment), `window_id?` | `ScreenshotComplete{filepath}` · `Error` |
 | `GetStats` | | `Stats{…}` |
 | `Shutdown` | | `Ack`, then the server exits |
 

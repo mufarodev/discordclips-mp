@@ -63,11 +63,12 @@ mod cli {
                     thumbnail_ms: None,
                     saved_at: None,
                     last_ms: Some(secs * 1000),
+                    embed_thumbnail: false,
                 })
             }
             "screenshot" => {
                 let out = flag(rest, "-o").map(PathBuf::from).unwrap_or_else(|| default_name("shot", "jpg"));
-                call(rest, Command::TakeScreenshot { filepath: abs(out), quality: 85 })
+                call(rest, Command::TakeScreenshot { filepath: abs(out), quality: 85, metadata: None, window_id: None })
             }
             "stats" => call(rest, Command::GetStats),
             "stop" => call(rest, Command::Shutdown),
@@ -93,7 +94,14 @@ mod cli {
         std::path::absolute(p).unwrap().to_string_lossy().into_owned()
     }
 
+    /// Default output name; goes in `$CLIPSD_CLIPS_DIR` (point it at the directory Discord reads
+    /// clips from) if set, else the current directory.
     fn default_name(prefix: &str, ext: &str) -> PathBuf {
+        let dir = std::env::var_os("CLIPSD_CLIPS_DIR").map(PathBuf::from).unwrap_or_default();
+        dir.join(default_file(prefix, ext))
+    }
+
+    fn default_file(prefix: &str, ext: &str) -> PathBuf {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -127,6 +135,7 @@ mod cli {
     }
 
     fn start(args: &[String]) -> i32 {
+        clipsd_macos::capture::init_window_server();
         let num = |name: &str, default: u32| flag(args, name).and_then(|s| s.parse().ok()).unwrap_or(default);
         let recorder = Arc::new(Recorder::new());
         if !args.iter().any(|a| a == "--idle") {
@@ -135,6 +144,8 @@ mod cli {
                 duration_ms: num("--buffer", 60) * 1000,
                 bitrate_kbps: num("--bitrate", 8000),
                 startup_delay_ms: 0,
+                width: None,
+                window_id: None,
             });
             match ev {
                 Event::RecordingEvent { .. } => {}

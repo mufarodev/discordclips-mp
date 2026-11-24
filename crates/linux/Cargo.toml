@@ -1,0 +1,16 @@
+[package]
+name = "clipsd-linux"
+version = "0.0.0"
+edition = "2021"
+
+# Everything below is Linux-only; the crate compiles to an empty lib elsewhere so that
+# `cargo test` at the workspace root keeps working on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+clipsd-core = { path = "../core" }
+serde_json = "1"
+ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+pipewire = "0.8"
+ffmpeg-next = "7"
+jpeg-encoder = "0.6"
+libc = "0.2"

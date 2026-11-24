@@ -28,7 +28,7 @@ use objc2_core_media::{
 use objc2_core_video::CVPixelBuffer;
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCContentFilter, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamErrorDomain, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
 
@@ -47,6 +47,17 @@ const AUDIO_CHANNEL_DEPTH: usize = 256;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGMainDisplayID() -> u32;
+}
+
+/// Initialize the CoreGraphics WindowServer connection on the main thread before any worker
+/// thread calls ScreenCaptureKit (`initWithDesktopIndependentWindow` otherwise aborts in
+/// `CGS_REQUIRE_INIT` on macOS).
+pub fn init_window_server() {
+    unsafe {
+        let _ = CGMainDisplayID();
+        let _ = CGPreflightScreenCaptureAccess();
+    }
 }
 
 /// A captured video frame: an IOSurface-backed pixel buffer.
@@ -262,10 +273,12 @@ pub struct CaptureConfig {
     pub fps: i32,
     /// Also capture system audio (48 kHz stereo), excluding this process's own audio.
     pub audio: bool,
+    /// Optional CGWindowID to capture; falls back to main display if absent or not found.
+    pub window_id: Option<u32>,
 }
 impl Default for CaptureConfig {
     fn default() -> Self {
-        Self { max_width: 1920, fps: 30, audio: true }
+        Self { max_width: 1920, fps: 30, audio: true, window_id: None }
     }
 }
 
@@ -287,14 +300,14 @@ pub struct SckCapture {
     repeats: u64,
 }
 
-fn fetch_display() -> Result<Retained<SCDisplay>, CaptureError> {
-    let (tx, rx) = mpsc::channel::<Result<Retained<SCDisplay>, CaptureError>>();
+fn fetch_content() -> Result<Retained<SCShareableContent>, CaptureError> {
+    let (tx, rx) = mpsc::channel::<Result<Retained<SCShareableContent>, CaptureError>>();
     let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
         let r = unsafe {
             if let Some(e) = err.as_ref() {
                 Err(map_error("shareable content", e))
-            } else if let Some(c) = content.as_ref() {
-                c.displays().firstObject().ok_or(CaptureError::NoDisplay)
+            } else if let Some(c) = NonNull::new(content) {
+                Ok(Retained::retain(c.as_ptr()).unwrap())
             } else {
                 Err(CaptureError::Sck("empty shareable content".into()))
             }
@@ -310,22 +323,50 @@ fn fetch_display() -> Result<Retained<SCDisplay>, CaptureError> {
     }
 }
 
+fn build_filter_and_size(
+    content: &SCShareableContent,
+    window_id: Option<u32>,
+    max_width: usize,
+    retina_scale: usize,
+) -> Result<(Retained<SCContentFilter>, usize, usize), CaptureError> {
+    if let Some(wid) = window_id {
+        let windows = unsafe { content.windows() };
+        for w in windows.iter() {
+            if unsafe { w.windowID() } == wid {
+                let frame = unsafe { w.frame() };
+                let rw = (frame.size.width.max(2.0) as usize) * retina_scale;
+                let rh = (frame.size.height.max(2.0) as usize) * retina_scale;
+                let width = (rw.min(max_width).max(2)) & !1;
+                let height = ((rh * width / rw.max(1)).max(2)) & !1;
+                let filter = unsafe {
+                    SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w)
+                };
+                return Ok((filter, width, height));
+            }
+        }
+        eprintln!("clipsd: window {wid} not found in shareable content; falling back to main display");
+    }
+    let display = unsafe { content.displays() }.firstObject().ok_or(CaptureError::NoDisplay)?;
+    let (dw, dh) = unsafe { (display.width() as usize * retina_scale, display.height() as usize * retina_scale) };
+    let width = (dw.min(max_width).max(2)) & !1;
+    let height = ((dh * width / dw.max(1)).max(2)) & !1;
+    let excluded = NSArray::new();
+    let filter = unsafe {
+        SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &excluded)
+    };
+    Ok((filter, width, height))
+}
+
 impl SckCapture {
-    /// Start capturing the first (main) display.
+    /// Start capturing the requested window (if present) or the first (main) display.
     pub fn start(cfg: &CaptureConfig) -> Result<Self, CaptureError> {
-        let display = fetch_display()?;
+        init_window_server();
+        let content = fetch_content()?;
         if !unsafe { CGPreflightScreenCaptureAccess() } {
             // SCK may still have returned content (redacted); treat as denied.
             return Err(CaptureError::PermissionDenied);
         }
-        let (dw, dh) = unsafe { (display.width() as usize, display.height() as usize) };
-        let width = (dw.min(cfg.max_width).max(2)) & !1;
-        let height = ((dh * width / dw.max(1)).max(2)) & !1;
-
-        let excluded = NSArray::new();
-        let filter = unsafe {
-            SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &excluded)
-        };
+        let (filter, width, height) = build_filter_and_size(&content, cfg.window_id, cfg.max_width, 1)?;
         let conf = unsafe { SCStreamConfiguration::new() };
         unsafe {
             conf.setWidth(width);
@@ -490,17 +531,19 @@ impl Capture for SckCapture {
 
 /// One-shot screenshot of the main display (macOS 14+), full resolution.
 pub fn screenshot_main_display() -> Result<CFRetained<objc2_core_graphics::CGImage>, CaptureError> {
+    screenshot(None)
+}
+
+/// One-shot screenshot of a specific window (falling back to main display), macOS 14+.
+pub fn screenshot(window_id: Option<u32>) -> Result<CFRetained<objc2_core_graphics::CGImage>, CaptureError> {
     use objc2_core_graphics::CGImage;
     use objc2_screen_capture_kit::SCScreenshotManager;
-    let display = fetch_display()?;
-    let excluded = NSArray::new();
-    let filter = unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &excluded)
-    };
+    let content = fetch_content()?;
+    let (filter, width, height) = build_filter_and_size(&content, window_id, 4096, 2)?;
     let conf = unsafe { SCStreamConfiguration::new() };
     unsafe {
-        conf.setWidth(display.width() as usize * 2);
-        conf.setHeight(display.height() as usize * 2);
+        conf.setWidth(width);
+        conf.setHeight(height);
         conf.setShowsCursor(true);
     }
     let (tx, rx) = mpsc::channel::<Result<CFRetained<CGImage>, CaptureError>>();

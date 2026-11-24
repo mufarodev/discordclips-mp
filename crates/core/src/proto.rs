@@ -18,6 +18,12 @@ pub enum Command {
         bitrate_kbps: u32,
         #[serde(default)]
         startup_delay_ms: u32,
+        /// Optional maximum capture width in pixels (default 1920).
+        #[serde(default)]
+        width: Option<u32>,
+        /// Optional macOS CGWindowID to capture; falls back to main display if absent/not found.
+        #[serde(default)]
+        window_id: Option<u32>,
     },
     StopRecording,
     SetDuration { duration_ms: u32 },
@@ -41,9 +47,27 @@ pub enum Command {
         /// Extension: keep only the most recent `last_ms` of the buffer (CLI convenience).
         #[serde(default)]
         last_ms: Option<u32>,
+        /// When true, embed the generated thumbnail as a JPEG data URL in metadata + `ClipSaved`
+        /// instead of leaving a sidecar `.jpg` file on disk.
+        #[serde(default)]
+        embed_thumbnail: bool,
     },
-    /// JPEG of the current display. `quality` is 1..=100.
-    TakeScreenshot { filepath: String, quality: u8 },
+    /// Replace the Discord `uuid` metadata box in an existing clip MP4.
+    UpdateClipMetadata {
+        filepath: String,
+        metadata: serde_json::Value,
+    },
+    /// JPEG of the current display (or `window_id` if provided). `quality` is 1..=100.
+    /// `metadata` is merged into the JPEG comment (Discord-format screenshots carry JSON with a
+    /// string `id`; one is generated if absent).
+    TakeScreenshot {
+        filepath: String,
+        quality: u8,
+        #[serde(default)]
+        metadata: Option<serde_json::Value>,
+        #[serde(default)]
+        window_id: Option<u32>,
+    },
     GetStats,
     Shutdown,
 }
@@ -121,7 +145,14 @@ mod tests {
     #[test]
     fn frames_roundtrip_and_eof() {
         let cmds = vec![
-            Command::StartRecording { fps: 30, duration_ms: 60_000, bitrate_kbps: 8000, startup_delay_ms: 0 },
+            Command::StartRecording {
+                fps: 30,
+                duration_ms: 60_000,
+                bitrate_kbps: 8000,
+                startup_delay_ms: 0,
+                width: None,
+                window_id: None,
+            },
             Command::SaveClip {
                 filepath: "/x.mp4".into(),
                 metadata: Some(serde_json::json!({"game": "x"})),
@@ -130,6 +161,7 @@ mod tests {
                 thumbnail_ms: Some(1000),
                 saved_at: None,
                 last_ms: None,
+                embed_thumbnail: false,
             },
             Command::Shutdown,
         ];

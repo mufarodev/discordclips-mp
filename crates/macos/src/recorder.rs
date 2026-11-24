@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clipsd_core::ipc::Service;
+use clipsd_core::metadata::with_defaults;
 use clipsd_core::proto::{Command, Event, Stats};
 use clipsd_core::{mux, AudioConfig, AudioRing, CodecConfig, Encoder, Ring};
 
@@ -72,7 +73,15 @@ impl Recorder {
         Self::default()
     }
 
-    fn start(&self, fps: u32, duration_ms: u32, bitrate_kbps: u32, startup_delay_ms: u32) -> Event {
+    fn start(
+        &self,
+        fps: u32,
+        duration_ms: u32,
+        bitrate_kbps: u32,
+        startup_delay_ms: u32,
+        width: Option<u32>,
+        window_id: Option<u32>,
+    ) -> Event {
         let mut slot = self.session.lock().unwrap();
         if slot.is_some() {
             return Event::Error { message: "already recording".into() };
@@ -80,7 +89,7 @@ impl Recorder {
         if startup_delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(startup_delay_ms as u64));
         }
-        match Self::spawn(fps.clamp(1, 120), duration_ms, bitrate_kbps.max(100)) {
+        match Self::spawn(fps.clamp(1, 120), duration_ms, bitrate_kbps.max(100), width, window_id) {
             Ok(s) => {
                 *slot = Some(s);
                 Event::RecordingEvent { state: "started".into() }
@@ -89,7 +98,13 @@ impl Recorder {
         }
     }
 
-    fn spawn(fps: u32, duration_ms: u32, bitrate_kbps: u32) -> Result<Session, String> {
+    fn spawn(
+        fps: u32,
+        duration_ms: u32,
+        bitrate_kbps: u32,
+        max_width: Option<u32>,
+        window_id: Option<u32>,
+    ) -> Result<Session, String> {
         let window_secs = duration_ms.div_ceil(1000).max(1);
         let state = Arc::new(Mutex::new(State {
             ring: Ring::new(window_secs),
@@ -111,7 +126,7 @@ impl Recorder {
             let (state, stop) = (state.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("clipsd-video".into())
-                .spawn(move || video_thread(fps, bitrate_kbps, state, stop, ctl_rx, init_tx))
+                .spawn(move || video_thread(fps, bitrate_kbps, max_width, window_id, state, stop, ctl_rx, init_tx))
                 .map_err(|e| e.to_string())?
         };
         let (width, height, audio_rx) = match init_rx.recv_timeout(Duration::from_secs(30)) {
@@ -172,6 +187,7 @@ impl Recorder {
         trim_end_ms: u32,
         thumbnail_ms: Option<u32>,
         last_ms: Option<u32>,
+        embed_thumbnail: bool,
     ) -> Event {
         let fail = |error: String| Event::ClipSaveFailed { filepath: filepath.to_string(), error };
 
@@ -205,17 +221,28 @@ impl Recorder {
         }
 
         let path = Path::new(filepath);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         // Write to a temp name and rename so a reader never sees a half-written clip.
         let tmp: PathBuf = path.with_extension("mp4.part");
-        let file = match std::fs::File::create(&tmp) {
+        let file = match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tmp) {
             Ok(f) => f,
             Err(e) => return fail(format!("{}: {e}", tmp.display())),
         };
         let audio_ref = audio.as_ref().filter(|(_, a)| !a.is_empty()).map(|(c, a)| (c, a.as_slice()));
         let audio_packets = audio_ref.map_or(0, |(_, a)| a.len());
+        let span_us = pkts.last().unwrap().pts_us - pkts[0].pts_us;
+        let duration_ms = (span_us / 1000) as u64;
         // Every clip carries the Discord `uuid` box; hosts own the metadata schema (default `{}`).
-        let meta = metadata.as_ref().map(|m| m.to_string()).unwrap_or_else(|| "{}".into());
-        if let Err(e) = mux::write_mp4_av(std::io::BufWriter::new(file), &cfg, &pkts, audio_ref, Some(meta.as_bytes())) {
+        let mut meta_val = with_defaults(metadata);
+        if embed_thumbnail {
+            if let serde_json::Value::Object(ref mut o) = meta_val {
+                o.insert("length".into(), serde_json::json!(duration_ms));
+            }
+        }
+        let meta = meta_val.to_string();
+        if let Err(e) = mux::write_mp4_av(file, &cfg, &pkts, audio_ref, Some(meta.as_bytes())) {
             let _ = std::fs::remove_file(&tmp);
             return fail(e);
         }
@@ -224,12 +251,26 @@ impl Recorder {
             return fail(format!("{}: {e}", path.display()));
         }
 
-        let span_us = pkts.last().unwrap().pts_us - pkts[0].pts_us;
-        let thumb_path = path.with_extension("jpg");
-        let thumbnail = match thumbnail::thumbnail_from_video(path, thumbnail_ms.unwrap_or(0), &thumb_path, THUMB_QUALITY) {
-            Ok(()) => Some(thumb_path.to_string_lossy().into_owned()),
-            Err(_) => None, // a missing thumbnail must not fail the clip
+        let thumbnail = if embed_thumbnail {
+            match thumbnail::thumbnail_bytes_from_video(path, thumbnail_ms.unwrap_or(0), THUMB_QUALITY) {
+                Ok(jpeg) => {
+                    let data_url = format!("data:image/jpeg;base64,{}", thumbnail::base64_encode(&jpeg));
+                    if let serde_json::Value::Object(ref mut o) = meta_val {
+                        o.insert("thumbnail".into(), serde_json::Value::String(data_url.clone()));
+                    }
+                    let _ = mux::update_discord_metadata(path, meta_val.to_string().as_bytes());
+                    Some(data_url)
+                }
+                Err(_) => None,
+            }
+        } else {
+            let thumb_path = path.with_extension("jpg");
+            match thumbnail::thumbnail_from_video(path, thumbnail_ms.unwrap_or(0), &thumb_path, THUMB_QUALITY) {
+                Ok(()) => Some(thumb_path.to_string_lossy().into_owned()),
+                Err(_) => None, // a missing thumbnail must not fail the clip
+            }
         };
+        let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         // First audio packet's start relative to the first video frame (ms). The muxer puts the
         // first kept audio packet at track time 0, so a clearly positive value means audio
         // would play early by that amount.
@@ -243,15 +284,16 @@ impl Recorder {
             "audio_packets": audio_packets,
             "width": cfg.width,
             "height": cfg.height,
-            "bytes": std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            "bytes": file_bytes,
+            "clipSizeBytes": file_bytes,
         })
         .to_string();
         Event::ClipSaved {
             filepath: filepath.to_string(),
-            duration_ms: (span_us / 1000) as u64,
+            duration_ms,
             stats_json,
             thumbnail,
-            metadata,
+            metadata: Some(meta_val),
         }
     }
 }
@@ -259,8 +301,8 @@ impl Recorder {
 impl Service for Recorder {
     fn handle(&self, cmd: Command) -> Event {
         match cmd {
-            Command::StartRecording { fps, duration_ms, bitrate_kbps, startup_delay_ms } => {
-                self.start(fps, duration_ms, bitrate_kbps, startup_delay_ms)
+            Command::StartRecording { fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id } => {
+                self.start(fps, duration_ms, bitrate_kbps, startup_delay_ms, width, window_id)
             }
             Command::StopRecording => self.stop(),
             Command::SetDuration { duration_ms } => match self.session.lock().unwrap().as_mut() {
@@ -282,13 +324,24 @@ impl Service for Recorder {
                 }
                 None => Event::Error { message: "not recording".into() },
             },
-            Command::SaveClip { filepath, metadata, trim_start_ms, trim_end_ms, thumbnail_ms, last_ms, .. } => {
-                self.save(&filepath, metadata, trim_start_ms, trim_end_ms, thumbnail_ms, last_ms)
+            Command::SaveClip { filepath, metadata, trim_start_ms, trim_end_ms, thumbnail_ms, last_ms, embed_thumbnail, .. } => {
+                self.save(&filepath, metadata, trim_start_ms, trim_end_ms, thumbnail_ms, last_ms, embed_thumbnail)
             }
-            Command::TakeScreenshot { filepath, quality } => {
-                let r = crate::capture::screenshot_main_display()
+            Command::UpdateClipMetadata { filepath, metadata } => {
+                match mux::update_discord_metadata(Path::new(&filepath), metadata.to_string().as_bytes()) {
+                    Ok(()) => Event::Ack,
+                    Err(message) => Event::Error { message },
+                }
+            }
+            Command::TakeScreenshot { filepath, quality, metadata, window_id } => {
+                let path = Path::new(&filepath);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let comment = with_defaults(metadata).to_string();
+                let r = crate::capture::screenshot(window_id)
                     .map_err(|e: CaptureError| e.to_string())
-                    .and_then(|img| thumbnail::write_jpeg(&img, Path::new(&filepath), quality));
+                    .and_then(|img| thumbnail::write_jpeg_with_comment(&img, path, quality, Some(&comment)));
                 match r {
                     Ok(()) => Event::ScreenshotComplete { filepath },
                     Err(message) => Event::Error { message },
@@ -303,15 +356,23 @@ impl Service for Recorder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn video_thread(
     fps: u32,
     bitrate_kbps: u32,
+    max_width: Option<u32>,
+    window_id: Option<u32>,
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     ctl: Receiver<Ctl>,
     init: Sender<Result<(u32, u32, Option<Receiver<PcmChunk>>), String>>,
 ) {
-    let ccfg = CaptureConfig { fps: fps as i32, ..CaptureConfig::default() };
+    let ccfg = CaptureConfig {
+        fps: fps as i32,
+        max_width: max_width.map(|w| w.clamp(320, 3840) as usize).unwrap_or(1920),
+        window_id,
+        ..CaptureConfig::default()
+    };
     let mut cap = match SckCapture::start(&ccfg) {
         Ok(c) => c,
         Err(e) => {

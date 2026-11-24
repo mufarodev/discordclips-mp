@@ -1,0 +1,7 @@
+{
+  "name": "discord_clips",
+  "version": "0.1.0",
+  "description": "Clean-room macOS/Linux clips worker module shim for clipsd",
+  "main": "index.js",
+  "private": true
+}
