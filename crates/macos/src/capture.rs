@@ -9,6 +9,7 @@
 //! clip of ~0 s, so `next_frame` re-submits the last complete buffer with an advanced pts when
 //! nothing has arrived for `REPEAT_AFTER`.
 
+use std::ptr::NonNull;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -20,7 +21,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_core_foundation::CFRetained;
-use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_audio_types::{kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, AudioBufferList};
+use objc2_core_media::{
+    CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMSampleBuffer, CMTime, CMTimeFlags,
+};
 use objc2_core_video::CVPixelBuffer;
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
@@ -35,6 +39,8 @@ const PIXEL_FORMAT_420V: u32 = 0x3432_3076;
 const SC_ERROR_USER_DECLINED: isize = -3801;
 const REPEAT_AFTER: Duration = Duration::from_millis(100);
 const CHANNEL_DEPTH: usize = 4;
+/// ~10 ms chunks arrive 100/s; leave a couple of seconds of slack.
+const AUDIO_CHANNEL_DEPTH: usize = 256;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -87,6 +93,14 @@ fn cmtime_to_us(t: CMTime) -> i64 {
     (t.value as i128 * 1_000_000 / t.timescale as i128) as i64
 }
 
+/// A chunk of captured system audio: interleaved f32 PCM, first frame at `pts_us` (host clock).
+pub struct PcmChunk {
+    pub pts_us: i64,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub samples: Vec<f32>,
+}
+
 struct Item {
     frame: Frame,
     pts_us: i64,
@@ -94,8 +108,82 @@ struct Item {
 
 struct SinkIvars {
     tx: Mutex<SyncSender<Item>>,
+    atx: Mutex<SyncSender<PcmChunk>>,
     /// Frames dropped because the consumer fell behind.
     dropped: std::sync::atomic::AtomicU64,
+    dropped_audio: std::sync::atomic::AtomicU64,
+}
+
+/// Copy an SCK audio sample buffer into interleaved f32. SCK delivers 32-bit float PCM, usually
+/// non-interleaved (one plane per channel).
+unsafe fn extract_pcm(sb: &CMSampleBuffer) -> Option<PcmChunk> {
+    let fd = sb.format_description()?;
+    let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(&fd).as_ref()?;
+    if asbd.mFormatFlags & kAudioFormatFlagIsFloat == 0 || asbd.mBitsPerChannel != 32 {
+        return None; // only f32 is handled
+    }
+    let ch = asbd.mChannelsPerFrame as usize;
+    let nonint = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0;
+    let frames = sb.num_samples() as usize;
+    if ch == 0 || frames == 0 {
+        return None;
+    }
+    // Two-step: ask how big the AudioBufferList is, then fetch it with exactly that size.
+    let mut needed = 0usize;
+    let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
+    let _size_status = sb.audio_buffer_list_with_retained_block_buffer(
+        &mut needed,
+        std::ptr::null_mut(),
+        0,
+        None,
+        None,
+        0,
+        std::ptr::null_mut(),
+    );
+    let mut storage = vec![0u64; needed.div_ceil(8).max(8)];
+    let st = sb.audio_buffer_list_with_retained_block_buffer(
+        std::ptr::null_mut(),
+        storage.as_mut_ptr().cast(),
+        needed,
+        None,
+        None,
+        0,
+        &mut block,
+    );
+    // Owns the +1 retain on the block buffer so the PCM stays valid until we're done.
+    let _guard = NonNull::new(block).map(|b| CFRetained::from_raw(b));
+    if st != 0 {
+        return None;
+    }
+    let abl = &*(storage.as_ptr() as *const AudioBufferList);
+    let bufs = std::slice::from_raw_parts(abl.mBuffers.as_ptr(), abl.mNumberBuffers as usize);
+    let mut out = vec![0f32; frames * ch];
+    if nonint {
+        if bufs.len() < ch {
+            return None;
+        }
+        for (c, b) in bufs.iter().take(ch).enumerate() {
+            let src = b.mData as *const f32;
+            if src.is_null() || (b.mDataByteSize as usize) < frames * 4 {
+                return None;
+            }
+            for i in 0..frames {
+                out[i * ch + c] = src.add(i).read_unaligned();
+            }
+        }
+    } else {
+        let b = bufs.first()?;
+        if b.mData.is_null() || (b.mDataByteSize as usize) < frames * ch * 4 {
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(b.mData as *const f32, out.as_mut_ptr(), frames * ch);
+    }
+    Some(PcmChunk {
+        pts_us: cmtime_to_us(sb.presentation_time_stamp()),
+        sample_rate: asbd.mSampleRate as u32,
+        channels: ch as u8,
+        samples: out,
+    })
 }
 
 define_class!(
@@ -109,21 +197,31 @@ define_class!(
     unsafe impl SCStreamOutput for FrameSink {
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
         fn stream_did_output(&self, _stream: &SCStream, sb: &CMSampleBuffer, ty: SCStreamOutputType) {
-            if ty != SCStreamOutputType::Screen {
-                return;
+            if ty == SCStreamOutputType::Screen {
+                self.handle(sb);
+            } else if ty == SCStreamOutputType::Audio {
+                self.handle_audio(sb);
             }
-            self.handle(sb);
         }
     }
 );
 
 impl FrameSink {
-    fn new(tx: SyncSender<Item>) -> Retained<Self> {
+    fn new(tx: SyncSender<Item>, atx: SyncSender<PcmChunk>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(SinkIvars {
             tx: Mutex::new(tx),
+            atx: Mutex::new(atx),
             dropped: Default::default(),
+            dropped_audio: Default::default(),
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn handle_audio(&self, sb: &CMSampleBuffer) {
+        let Some(chunk) = (unsafe { extract_pcm(sb) }) else { return };
+        if let Err(TrySendError::Full(_)) = self.ivars().atx.lock().unwrap().try_send(chunk) {
+            self.ivars().dropped_audio.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Frame status from the sample attachments; `None` if absent.
@@ -160,10 +258,12 @@ pub struct CaptureConfig {
     /// H.264 encoder tops out around 4096 wide; 1920 is a safe default.
     pub max_width: usize,
     pub fps: i32,
+    /// Also capture system audio (48 kHz stereo), excluding this process's own audio.
+    pub audio: bool,
 }
 impl Default for CaptureConfig {
     fn default() -> Self {
-        Self { max_width: 1920, fps: 30 }
+        Self { max_width: 1920, fps: 30, audio: true }
     }
 }
 
@@ -172,6 +272,7 @@ pub struct SckCapture {
     _sink: Retained<FrameSink>,
     _queue: DispatchRetained<DispatchQueue>,
     rx: Receiver<Item>,
+    audio_rx: Option<Receiver<PcmChunk>>,
     /// Output size in pixels.
     pub width: usize,
     pub height: usize,
@@ -232,10 +333,17 @@ impl SckCapture {
             conf.setQueueDepth(5);
             conf.setShowsCursor(true);
             conf.setScalesToFit(true);
+            if cfg.audio {
+                conf.setCapturesAudio(true);
+                conf.setSampleRate(48_000);
+                conf.setChannelCount(2);
+                conf.setExcludesCurrentProcessAudio(true);
+            }
         }
 
         let (tx, rx) = mpsc::sync_channel(CHANNEL_DEPTH);
-        let sink = FrameSink::new(tx);
+        let (atx, arx) = mpsc::sync_channel(AUDIO_CHANNEL_DEPTH);
+        let sink = FrameSink::new(tx, atx);
         let queue = DispatchQueue::new("clipsd.capture", None);
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &conf, None) };
         unsafe {
@@ -246,6 +354,18 @@ impl SckCapture {
                     Some(&queue),
                 )
                 .map_err(|e| map_error("addStreamOutput", &e))?;
+        }
+
+        if cfg.audio {
+            unsafe {
+                stream
+                    .addStreamOutput_type_sampleHandlerQueue_error(
+                        ProtocolObject::from_ref(&*sink),
+                        SCStreamOutputType::Audio,
+                        Some(&queue),
+                    )
+                    .map_err(|e| map_error("addStreamOutput(audio)", &e))?;
+            }
         }
 
         let (stx, srx) = mpsc::channel::<Option<CaptureError>>();
@@ -259,7 +379,17 @@ impl SckCapture {
             Err(_) => return Err(CaptureError::Sck("timed out starting capture".into())),
         }
 
-        Ok(Self { stream, _sink: sink, _queue: queue, rx, width, height, last: None, last_emitted_us: i64::MIN })
+        Ok(Self { stream, _sink: sink, _queue: queue, rx, audio_rx: cfg.audio.then_some(arx), width, height, last: None, last_emitted_us: i64::MIN })
+    }
+
+    /// Take the audio chunk receiver (once). `None` if audio capture is off or already taken.
+    pub fn take_audio(&mut self) -> Option<Receiver<PcmChunk>> {
+        self.audio_rx.take()
+    }
+
+    /// Audio chunks dropped because the consumer was too slow.
+    pub fn dropped_audio(&self) -> u64 {
+        self._sink.ivars().dropped_audio.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Frames the SCK callback dropped because the consumer was too slow.

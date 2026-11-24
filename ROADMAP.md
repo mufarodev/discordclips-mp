@@ -13,7 +13,7 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [~] CLI: `clipsd start | save <secs> | stop` done; `screenshot` todo (`start`/`save`/`stop` talk over a minimal line protocol on `$TMPDIR/clipsd.sock`, replaced by the M5 vocabulary)
 
 ## Phase 2 — Audio + protocol
-- [ ] **M4 Audio**: ScreenCaptureKit system/app audio PCM → AAC-LC (AudioToolbox) → second mp4 track; A/V sync check.
+- [x] **M4 Audio** (A/V sync by ear/visual check still TODO): ScreenCaptureKit system/app audio PCM → AAC-LC (AudioToolbox) → second mp4 track; A/V sync check.
 - [ ] **M5 IPC**: Unix-socket server with the Windows command/event vocabulary (see REFERENCE.md): StartRecording, StopRecording, SetDuration, SetBitrate, SaveClip, TakeScreenshot, GetStats, Shutdown ↔ ClipSaved, ClipSaveFailed, Stats, Error.
 - [ ] Live bitrate change without restarting the session.
 

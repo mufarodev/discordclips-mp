@@ -86,7 +86,8 @@ mod client {
 
 #[cfg(target_os = "macos")]
 mod daemon {
-    use clipsd_core::{mux, Capture, CodecConfig, Encoder, Ring};
+    use clipsd_core::{mux, AudioConfig, AudioRing, Capture, CodecConfig, Encoder, Ring};
+    use clipsd_macos::aac::AacEncoder;
     use clipsd_macos::capture::{CaptureConfig, SckCapture};
     use clipsd_macos::encode::{EncoderConfig, VtEncoder};
     use std::io::{BufRead, BufReader, Write};
@@ -97,6 +98,8 @@ mod daemon {
     struct State {
         ring: Ring,
         config: Option<CodecConfig>,
+        audio: AudioRing,
+        audio_cfg: Option<AudioConfig>,
         frames: u64,
     }
 
@@ -129,7 +132,7 @@ mod daemon {
                 return 2;
             }
         };
-        let state = Arc::new(Mutex::new(State { ring: Ring::new(buffer), config: None, frames: 0 }));
+        let state = Arc::new(Mutex::new(State { ring: Ring::new(buffer), config: None, audio: AudioRing::new(buffer + 5), audio_cfg: None, frames: 0 }));
         let stop = Arc::new(AtomicBool::new(false));
 
         let listener = match UnixListener::bind(&sock) {
@@ -144,6 +147,38 @@ mod daemon {
             std::thread::spawn(move || {
                 for conn in listener.incoming().flatten() {
                     handle(conn, &state, &stop);
+                }
+            });
+        }
+        if let Some(rx) = cap.take_audio() {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let mut enc: Option<AacEncoder> = None;
+                for chunk in rx {
+                    if enc.is_none() {
+                        match AacEncoder::new(chunk.sample_rate, chunk.channels, 128_000) {
+                            Ok(e) => {
+                                state.lock().unwrap().audio_cfg = Some(e.cfg.clone());
+                                enc = Some(e);
+                            }
+                            Err(e) => {
+                                eprintln!("audio disabled: {e}");
+                                return;
+                            }
+                        }
+                    }
+                    match enc.as_mut().unwrap().push(chunk.pts_us, &chunk.samples) {
+                        Ok(pkts) => {
+                            let mut st = state.lock().unwrap();
+                            for p in pkts {
+                                st.audio.push(p);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("audio encode error: {e}");
+                            return;
+                        }
+                    }
                 }
             });
         }
@@ -201,17 +236,24 @@ mod daemon {
 
     fn save(state: &Mutex<State>, secs: u32, path: &str) -> Result<String, String> {
         // Hold the lock only to copy the snapshot; muxing/IO happens outside it.
-        let (pkts, cfg) = {
+        let (pkts, cfg, audio) = {
             let st = state.lock().unwrap();
-            (st.ring.snapshot(secs), st.config.clone())
+            let pkts = st.ring.snapshot(secs);
+            let audio = match (&st.audio_cfg, pkts.first(), pkts.last()) {
+                (Some(ac), Some(f), Some(l)) => Some((ac.clone(), st.audio.range(f.pts_us, l.pts_us))),
+                _ => None,
+            };
+            (pkts, st.config.clone(), audio)
         };
         let cfg = cfg.ok_or("no video buffered yet")?;
         if pkts.is_empty() {
             return Err("nothing buffered yet".into());
         }
         let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
-        mux::write_mp4(std::io::BufWriter::new(file), &cfg, &pkts)?;
+        let audio_ref = audio.as_ref().filter(|(_, a)| !a.is_empty()).map(|(c, a)| (c, a.as_slice()));
+        let n_audio = audio_ref.map_or(0, |(_, a)| a.len());
+        mux::write_mp4_av(std::io::BufWriter::new(file), &cfg, &pkts, audio_ref)?;
         let span = (pkts.last().unwrap().pts_us - pkts[0].pts_us) as f64 / 1e6;
-        Ok(format!("ok {path} frames={} span={span:.2}s", pkts.len()))
+        Ok(format!("ok {path} frames={} audio_packets={n_audio} span={span:.2}s", pkts.len()))
     }
 }

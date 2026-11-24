@@ -25,6 +25,44 @@ pub struct CodecConfig {
     pub pps: Vec<u8>,
 }
 
+/// Audio stream parameters for the AAC-LC track. Packets are raw AAC frames (no ADTS), 1024
+/// samples each, so a packet's duration is `1024 / sample_rate`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioConfig {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub bitrate_bps: u32,
+}
+
+/// Samples per AAC-LC frame.
+pub const AAC_FRAME_SAMPLES: u32 = 1024;
+
+/// Rolling buffer of encoded audio packets (every AAC frame is independently decodable, so
+/// unlike video there is no GOP alignment). Trimmed purely by time.
+pub struct AudioRing {
+    window_us: i64,
+    pkts: VecDeque<Packet>,
+}
+
+impl AudioRing {
+    pub fn new(window_secs: u32) -> Self {
+        Self { window_us: window_secs as i64 * 1_000_000, pkts: VecDeque::new() }
+    }
+    pub fn push(&mut self, p: Packet) {
+        self.pkts.push_back(p);
+        let newest = self.pkts.back().unwrap().pts_us;
+        while self.pkts.front().is_some_and(|f| newest - f.pts_us > self.window_us) {
+            self.pkts.pop_front();
+        }
+    }
+    /// All packets covering `[start_us, end_us]` (a packet starting just before `start_us` is
+    /// kept if it overlaps it).
+    pub fn range(&self, start_us: i64, end_us: i64) -> Vec<Packet> {
+        let frame_us = 1_000_000 * AAC_FRAME_SAMPLES as i64 / 48_000;
+        self.pkts.iter().filter(|p| p.pts_us + frame_us > start_us && p.pts_us <= end_us).cloned().collect()
+    }
+}
+
 /// Platform seam #2: hardware encoder.
 pub trait Encoder {
     type Frame;
@@ -108,7 +146,7 @@ mod tests {
 
 pub mod mux {
     //! MP4 muxing (pure Rust, `mp4` crate). Runs at save time only.
-    use super::{CodecConfig, Packet};
+    use super::{AudioConfig, CodecConfig, Packet, AAC_FRAME_SAMPLES};
     use std::io::{Seek, Write};
 
     /// Media timescale for the video track.
@@ -121,7 +159,22 @@ pub mod mux {
     /// and the writer emits no edit list). Each sample's duration is the gap to the next one;
     /// the last sample reuses the previous gap.
     pub fn write_mp4<W: Write + Seek>(w: W, cfg: &CodecConfig, packets: &[Packet]) -> Result<(), String> {
-        use mp4::{AvcConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType};
+        write_mp4_av(w, cfg, packets, None)
+    }
+
+    /// Like [`write_mp4`], plus an optional AAC-LC audio track. Audio packets are placed on the
+    /// same (rebased) timeline as the video; those ending before the first video sample are
+    /// dropped. Samples are written interleaved by time.
+    pub fn write_mp4_av<W: Write + Seek>(
+        w: W,
+        cfg: &CodecConfig,
+        packets: &[Packet],
+        audio: Option<(&AudioConfig, &[Packet])>,
+    ) -> Result<(), String> {
+        use mp4::{
+            AacConfig, AudioObjectType, AvcConfig, ChannelConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample,
+            Mp4Writer, SampleFreqIndex, TrackConfig, TrackType,
+        };
 
         let first = packets.first().ok_or("no packets to write")?;
         if !first.keyframe {
@@ -158,8 +211,38 @@ pub mod mux {
         })
         .map_err(e)?;
 
+        let audio_track = if let Some((ac, _)) = audio {
+            let freq_index = match ac.sample_rate {
+                48_000 => SampleFreqIndex::Freq48000,
+                44_100 => SampleFreqIndex::Freq44100,
+                n => return Err(format!("unsupported AAC sample rate {n}")),
+            };
+            let chan_conf = match ac.channels {
+                1 => ChannelConfig::Mono,
+                2 => ChannelConfig::Stereo,
+                n => return Err(format!("unsupported AAC channel count {n}")),
+            };
+            mw.add_track(&TrackConfig {
+                track_type: TrackType::Audio,
+                timescale: ac.sample_rate,
+                language: "und".into(),
+                media_conf: MediaConfig::AacConfig(AacConfig {
+                    bitrate: ac.bitrate_bps,
+                    profile: AudioObjectType::AacLowComplexity,
+                    freq_index,
+                    chan_conf,
+                }),
+            })
+            .map_err(e)?;
+            Some(2u32)
+        } else {
+            None
+        };
+
+        // Video samples: (time_us, track, Mp4Sample).
         let ticks = |p: &Packet| ((p.pts_us - first.pts_us) as i128 * TIMESCALE as i128 / 1_000_000) as u64;
         let mut prev_dur = (TIMESCALE / 30) as u32;
+        let mut items: Vec<(i64, u32, Mp4Sample)> = Vec::with_capacity(packets.len());
         for (i, p) in packets.iter().enumerate() {
             let start = ticks(p);
             let duration = match packets.get(i + 1) {
@@ -167,17 +250,45 @@ pub mod mux {
                 None => prev_dur,
             };
             prev_dur = duration;
-            mw.write_sample(
+            items.push((
+                p.pts_us,
                 1,
-                &Mp4Sample {
+                Mp4Sample {
                     start_time: start,
                     duration,
                     rendering_offset: 0,
                     is_sync: p.keyframe,
                     bytes: bytes::Bytes::copy_from_slice(&p.data),
                 },
-            )
-            .map_err(e)?;
+            ));
+        }
+        if let (Some(_), Some((ac, apkts))) = (audio_track, audio) {
+            let frame_us = 1_000_000 * AAC_FRAME_SAMPLES as i64 / ac.sample_rate as i64;
+            let end_us = packets.last().map(|p| p.pts_us).unwrap_or(first.pts_us);
+            // Timeline origin for audio: first kept packet, clamped to the video start.
+            let kept: Vec<&Packet> =
+                apkts.iter().filter(|p| p.pts_us + frame_us > first.pts_us && p.pts_us <= end_us).collect();
+            if !kept.is_empty() {
+                for (i, p) in kept.iter().enumerate() {
+                    // Constant 1024-sample duration; start time derived from the packet index so
+                    // the track stays gapless (the encoder already filled any capture gaps).
+                    items.push((
+                        p.pts_us,
+                        2,
+                        Mp4Sample {
+                            start_time: i as u64 * AAC_FRAME_SAMPLES as u64,
+                            duration: AAC_FRAME_SAMPLES,
+                            rendering_offset: 0,
+                            is_sync: true,
+                            bytes: bytes::Bytes::copy_from_slice(&p.data),
+                        },
+                    ));
+                }
+            }
+        }
+        items.sort_by_key(|(t, trk, _)| (*t, *trk));
+        for (_, track, sample) in &items {
+            mw.write_sample(*track, sample).map_err(e)?;
         }
         mw.write_end().map_err(e)
     }
@@ -210,6 +321,31 @@ pub mod mux {
             // Movie-level duration (what players honour) must equal the media duration.
             let movie = r.duration().as_secs_f64();
             assert!((movie - d).abs() < 0.001, "movie {movie} vs media {d}");
+        }
+
+        #[test]
+        fn av_roundtrip_two_tracks_and_audio_aligned() {
+            let cfg = CodecConfig { width: 640, height: 480, sps: vec![0x67, 0x64, 0x00, 0x28, 0xac], pps: vec![0x68, 0xee, 0x3c, 0x80] };
+            let ac = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_bps: 128_000 };
+            let base = 1_000_000_000i64;
+            let vid: Vec<Packet> = (0..60)
+                .map(|i| Packet { pts_us: base + i * 33_333, keyframe: i % 30 == 0, data: vec![0, 0, 0, 2, 0x65, i as u8] })
+                .collect();
+            // audio starts 100ms *before* video and runs past its end
+            let frame_us = 1_000_000 * 1024 / 48_000;
+            let aud: Vec<Packet> = (0..120)
+                .map(|i| Packet { pts_us: base - 100_000 + i * frame_us, keyframe: true, data: vec![0x21, i as u8, 0, 0] })
+                .collect();
+            let mut buf = std::io::Cursor::new(Vec::new());
+            write_mp4_av(&mut buf, &cfg, &vid, Some((&ac, &aud))).unwrap();
+            let len = buf.get_ref().len() as u64;
+            buf.set_position(0);
+            let r = mp4::Mp4Reader::read_header(buf, len).unwrap();
+            assert_eq!(r.tracks().len(), 2);
+            let a = r.tracks().values().find(|t| t.track_type().unwrap() == mp4::TrackType::Audio).unwrap();
+            assert!(a.sample_count() > 80 && a.sample_count() < 100, "audio samples {}", a.sample_count());
+            let v = r.tracks().values().find(|t| t.track_type().unwrap() == mp4::TrackType::Video).unwrap();
+            assert_eq!(v.sample_count(), 60);
         }
 
         #[test]
