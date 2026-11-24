@@ -2,3 +2,4 @@
 #![cfg(target_os = "macos")]
 
 pub mod capture;
+pub mod encode;

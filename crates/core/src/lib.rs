@@ -15,10 +15,26 @@ pub trait Capture {
     fn next_frame(&mut self) -> Result<(Self::Frame, i64 /* pts_us */), String>;
 }
 
+/// Stream parameters needed to mux H.264 (the `avcC` box). Packets carry AVCC data with
+/// 4-byte NAL length prefixes; SPS/PPS are raw NAL units without a start code or length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecConfig {
+    pub width: u32,
+    pub height: u32,
+    pub sps: Vec<u8>,
+    pub pps: Vec<u8>,
+}
+
 /// Platform seam #2: hardware encoder.
 pub trait Encoder {
     type Frame;
+    /// Submit a frame. Encoders may be asynchronous: this returns whatever packets have
+    /// finished since the previous call, which may be none (or packets for earlier frames).
     fn encode(&mut self, frame: Self::Frame, pts_us: i64) -> Result<Vec<Packet>, String>;
+    /// Force out and return all in-flight packets.
+    fn flush(&mut self) -> Result<Vec<Packet>, String>;
+    /// Available once the first keyframe has been produced.
+    fn codec_config(&self) -> Option<CodecConfig>;
 }
 
 /// Rolling buffer of encoded packets, trimmed on GOP boundaries so it always starts on a keyframe.

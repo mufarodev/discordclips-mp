@@ -7,7 +7,7 @@ Legend: [ ] todo · [~] in progress · [x] done
 
 ## Phase 1 — macOS standalone (video only)
 - [x] **M1 Capture**: ScreenCaptureKit stream (display first, window/app filter later) logs frame count + pts. Handles Screen Recording permission (TCC) failure with a clear error.
-- [ ] **M2 Encode**: `VTCompressionSession` H.264, real-time, fixed keyframe interval (2s), outputs AVCC `Packet`s with correct `keyframe` flag + SPS/PPS from the format description.
+- [x] **M2 Encode**: `VTCompressionSession` H.264, real-time, fixed keyframe interval (2s), outputs AVCC `Packet`s with correct `keyframe` flag + SPS/PPS from the format description.
 - [ ] **M3 Save**: `Ring` + `save(last N s)` → playable `.mp4` (pure-Rust `mp4` crate). First demo. Verify in QuickTime and `ffprobe`.
 - [ ] **M3b** Thumbnail from first keyframe.
 - [ ] CLI: `clipsd start | save <secs> | stop | screenshot`
