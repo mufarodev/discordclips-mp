@@ -1,4 +1,4 @@
-//! M2: VideoToolbox H.264 hardware encoder.
+//! VideoToolbox H.264 hardware encoder.
 //!
 //! Real-time, no frame reordering (so pts == dts and `Packet` needs no ctts), keyframe at
 //! least every 2 s. Output is AVCC (4-byte length prefixes); SPS/PPS are pulled from the
@@ -206,7 +206,6 @@ impl VtEncoder {
         set_prop(&self.session, unsafe { kVTCompressionPropertyKey_AverageBitRate }, &CFNumber::new_i32(bitrate_bps))
     }
 
-    /// Frames the encoder dropped (real-time mode may drop under load).
     pub fn dropped(&self) -> u64 {
         self.shared.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }

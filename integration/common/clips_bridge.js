@@ -12,7 +12,6 @@ const path = require("path");
 
 const MAX_FRAME = 16 * 1024 * 1024;
 
-// ClipsRecordingEvent enum values expected by MediaEngineNative (see REFERENCE.md).
 const RecordingEvent = {
   Started: 0,
   Ended: 1,
@@ -314,8 +313,6 @@ function attachClipsBridge(VoiceEngine, features) {
     emitEvent(RecordingEvent.RecordingInactive);
   }
 
-  // --- VoiceEngine Clips V3 interface overrides ---
-
   VoiceEngine.setClipsModulePath = function (dir) {
     if (typeof dir === "string" && dir.length > 0) {
       clipsModulePath = dir;
@@ -556,14 +553,12 @@ function attachClipsBridge(VoiceEngine, features) {
     return Math.floor(performance.now());
   };
 
-  // Declare Clips capabilities so Discord's renderer enables the native Clips V3 path.
   if (features && typeof features.declareSupported === "function") {
     features.declareSupported("clips");
     features.declareSupported("clips_thumbnail");
     features.declareSupported("clips_recording_ready_events");
   }
 
-  // Optional diagnostics: set CLIPSD_TRACE=1 to log every Clips-related VoiceEngine call.
   if (process.env.CLIPSD_TRACE) {
     const names = Object.keys(VoiceEngine).filter((k) => /clip|screenshot/i.test(k) && typeof VoiceEngine[k] === "function");
     console.info("[clipsd-bridge] clip-related VoiceEngine methods:", names.join(","));
@@ -579,7 +574,6 @@ function attachClipsBridge(VoiceEngine, features) {
     }
   }
 
-  // Convenience handle for DevTools debugging/verification.
   if (typeof globalThis.window !== "undefined") {
     globalThis.window.__clipsdBridge = {
       stats: () => client.call({ type: "GetStats" }),

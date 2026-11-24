@@ -1,4 +1,4 @@
-//! M2 demo: capture → VideoToolbox H.264, report packets, keyframe cadence and SPS/PPS.
+//! Capture -> VideoToolbox H.264 diagnostic (packet/keyframe/SPS/PPS stats).
 //! Usage: m2_encode [seconds]  (default 8)
 #[cfg(target_os = "macos")]
 fn main() {

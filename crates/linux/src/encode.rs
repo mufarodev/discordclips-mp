@@ -1,14 +1,4 @@
-//! Linux hardware video (`av1_nvenc` → `h264_nvenc` → `libx264`, with zero-copy CUDA hwframes
-//! via `gpu::GpuCudaBridge`) and AAC-LC audio encoding via `libavcodec`.
-//!
-//! - For AV1 (`av1_nvenc`), strips temporal delimiters and extracts `av1C` via
-//!   `clipsd_core::av1::{prepare_av1_sample, build_av1c}` so `clipsd_core::mux` writes a
-//!   spec-compliant `av01` + `av1C` MP4 accepted by Discord's `mp4box.js` clip editor.
-//! - For H.264 (`h264_nvenc`, `libx264`), converts Annex-B packets to 4-byte length-prefixed AVCC
-//!   + SPS/PPS via `clipsd_core::h264`.
-//!
-//! Override encoder selection with `CLIPSD_ENCODER=av1_nvenc|h264_nvenc|libx264` or
-//! `CLIPSD_CODEC=av1|h264`.
+//! Linux video (`av1_nvenc` / `h264_nvenc` / `libx264`, CUDA zero-copy or CPU NV12) and AAC-LC encoding.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -103,8 +93,6 @@ fn encoder_candidates() -> Vec<String> {
 }
 
 impl FfmpegVideoEncoder {
-    /// Open a video encoder, preferring RTX 40-series hardware AV1 (`av1_nvenc`), then
-    /// `h264_nvenc`, then `libx264` (`ultrafast` + `zerolatency`).
     pub fn new(cfg: &EncoderConfig) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
@@ -160,7 +148,6 @@ impl FfmpegVideoEncoder {
             let mut opts = ffmpeg::Dictionary::new();
             match name.as_str() {
                 "av1_nvenc" => {
-                    // Ada Lovelace (RTX 40-series) low-latency rolling buffer config.
                     opts.set("preset", "p3");
                     opts.set("tune", "ll");
                     opts.set("rc", "cbr");

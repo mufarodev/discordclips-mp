@@ -1,20 +1,4 @@
-/*
- * libclipsd_vk_layer.so — Dormant implicit Vulkan DMA-BUF capture layer for clipsd.
- *
- * Self-contained (zero external Vulkan headers needed, links only libc + libpthread so it loads
- * cleanly inside native Linux apps, Steam Linux Runtime containers, and Proton/DXVK/VKD3D).
- *
- * Lifecycle:
- * - Dormant by default (~0 overhead): only opens an abstract Unix listener
- *   "\0clipsd-vk-<uid>-<pid>" when a swapchain is created.
- * - When clipsd connects (verified via SO_PEERCRED uid == getuid()), allocates 2 ping-pong
- *   DMA-BUF staging images (using NVIDIA/Mesa non-linear DRM format modifiers), exports their
- *   DMA-BUF fds once via SCM_RIGHTS, and on each vkQueuePresentKHR (paced to target_fps) blits
- *   the swapchain image to the staging image on the GPU without stalling the game's render loop.
- * - A tiny per-swapchain notifier thread waits on each slot's VkFence and sends a 48-byte FRAME
- *   notification to clipsd. When clipsd disconnects, staging resources are freed and the layer
- *   returns to dormant.
- */
+/* Dormant implicit Vulkan DMA-BUF capture layer for clipsd (self-contained, libc+pthread only). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -29,10 +13,6 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
-
-/* =========================================================================
- * Minimal Vulkan 1.1+ C ABI definitions (x86_64 Linux)
- * ========================================================================= */
 
 typedef uint32_t VkFlags;
 typedef uint32_t VkBool32;
@@ -129,7 +109,6 @@ typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(VkDevice, const char *);
 typedef struct { uint32_t sType; const void *pNext; } VkBaseInStructure;
 typedef struct { uint32_t sType; void *pNext; } VkBaseOutStructure;
 
-/* Loader layer negotiation */
 typedef struct VkNegotiateLayerInterface {
     uint32_t sType;
     void *pNext;
@@ -464,7 +443,6 @@ typedef struct {
     const VkSemaphore *pSignalSemaphores;
 } VkSubmitInfo;
 
-/* Function pointer typedefs */
 typedef VkResult (*PFN_vkCreateInstance)(const VkInstanceCreateInfo *, const void *, VkInstance *);
 typedef void     (*PFN_vkDestroyInstance)(VkInstance, const void *);
 typedef VkResult (*PFN_vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo *, const void *, VkDevice *);
@@ -506,10 +484,6 @@ typedef VkResult (*PFN_vkWaitForFences)(VkDevice, uint32_t, const VkFence *, VkB
 typedef VkResult (*PFN_vkResetFences)(VkDevice, uint32_t, const VkFence *);
 typedef VkResult (*PFN_vkDeviceWaitIdle)(VkDevice);
 
-/* =========================================================================
- * Wire protocol with clipsd (abstract Unix socket "\0clipsd-vk-<uid>-<pid>")
- * ========================================================================= */
-
 #define CLVK_MAGIC 0x434C564BU /* 'CLVK' */
 #define CLVK_MSG_SETUP 1U
 #define CLVK_MSG_FRAME 2U
@@ -542,10 +516,6 @@ static inline int64_t monotonic_us(void) {
 static inline void *dispatch_key(const void *handle) {
     return *(void *const *)handle;
 }
-
-/* =========================================================================
- * Layer state tables
- * ========================================================================= */
 
 #define MAX_INSTANCES  16
 #define MAX_DEVICES    32
@@ -637,7 +607,6 @@ typedef struct {
     uint32_t image_count;
     VkImage *images;
 
-    /* Active capture state (only allocated when clipsd is connected) */
     bool capture_ready;
     uint32_t queue_family;
     VkCommandPool cmd_pool;
@@ -647,7 +616,6 @@ typedef struct {
     int64_t next_due_us;
     uint32_t accept_poll_div;
 
-    /* Async fence-wait + socket notifier thread (keeps vkQueuePresentKHR non-blocking) */
     pthread_t notify_thread;
     bool notify_running;
     bool notify_stop;
@@ -664,7 +632,6 @@ static DevData  g_devs[MAX_DEVICES];
 static QueueEntry g_queues[MAX_QUEUES];
 static SwapchainData g_swaps[MAX_SWAPCHAINS];
 
-/* Global per-process IPC state */
 static int g_listen_fd = -1;
 static int g_client_fd = -1;
 static uint32_t g_target_fps = 60;
@@ -710,10 +677,6 @@ static SwapchainData *find_swap(VkSwapchainKHR sc) {
     return NULL;
 }
 
-/* =========================================================================
- * IPC helpers (abstract Unix socket + SCM_RIGHTS)
- * ========================================================================= */
-
 static void ensure_listener_locked(void) {
     if (g_listen_fd >= 0) return;
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -746,7 +709,6 @@ static void poll_accept_locked(void) {
     int cfd = accept4(g_listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (cfd < 0) return;
 
-    /* Verify same UID via SO_PEERCRED */
     struct ucred cred;
     socklen_t clen = sizeof(cred);
     if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) != 0 || cred.uid != getuid()) {
@@ -754,7 +716,6 @@ static void poll_accept_locked(void) {
         return;
     }
 
-    /* Read 8-byte Hello with short timeout */
     struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -791,10 +752,6 @@ static bool send_msg_with_fds(int fd, const ClvkMsg *msg, const int *fds, int nf
     return sent == (ssize_t)sizeof(*msg);
 }
 
-/* =========================================================================
- * Swapchain capture resource allocation & notifier thread
- * ========================================================================= */
-
 static void *notify_thread_main(void *arg) {
     SwapchainData *sc = (SwapchainData *)arg;
     DevData *dev = sc->dev;
@@ -811,7 +768,6 @@ static void *notify_thread_main(void *arg) {
         sc->notify_head = (sc->notify_head + 1) & 3;
         pthread_mutex_unlock(&sc->notify_mu);
 
-        /* Wait for GPU blit into this slot to complete (max 100ms) */
         VkFence fence = sc->slots[item.slot].fence;
         if (dev->WaitForFences(dev->device, 1, &fence, 1, 100000000ULL) != VK_SUCCESS) {
             continue;
@@ -892,7 +848,6 @@ static bool init_capture_resources(SwapchainData *sc, uint32_t queue_family) {
         sc->slots[i].dmabuf_fd = -1;
     }
 
-    /* Query single-plane DRM format modifiers supporting TRANSFER_DST on B8G8R8A8_UNORM. */
     uint64_t chosen_mods[64];
     uint32_t chosen_mod_count = 0;
     bool use_modifier_tiling = false;
@@ -1116,10 +1071,6 @@ static bool send_setup_locked(SwapchainData *sc) {
     return true;
 }
 
-/* =========================================================================
- * Hooked Vulkan functions
- * ========================================================================= */
-
 static VkResult clipsd_CreateInstance(
     const VkInstanceCreateInfo *pCreateInfo,
     const void *pAllocator,
@@ -1210,7 +1161,6 @@ static VkResult clipsd_CreateDevice(
     InstData *id = find_inst(phys);
     pthread_mutex_unlock(&g_mu);
 
-    /* Append DMA-BUF export device extensions if supported by the physical device. */
     static const char *const kWantExts[] = {
         "VK_KHR_external_memory",
         "VK_KHR_external_memory_fd",
@@ -1626,10 +1576,6 @@ static VkResult clipsd_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pP
     pthread_mutex_unlock(&g_mu);
     return next(queue, &mod_pi);
 }
-
-/* =========================================================================
- * Vulkan layer entrypoints
- * ========================================================================= */
 
 __attribute__((visibility("default")))
 PFN_vkVoidFunction clipsd_GetDeviceProcAddr(VkDevice device, const char *pName) {

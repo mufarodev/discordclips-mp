@@ -1,7 +1,6 @@
-//! Portable JPEG COM metadata splicing and RFC 4648 base64 encoding.
+//! JPEG COM metadata splicing and RFC 4648 base64 encoding.
 
-/// Insert a JPEG COM (comment) segment right after SOI. Discord-format screenshots carry their
-/// metadata as JSON in this segment (interface note, see REFERENCE.md).
+/// Insert a JPEG COM (comment) segment right after SOI.
 pub fn jpeg_with_comment(jpeg: &[u8], comment: &str) -> Result<Vec<u8>, String> {
     if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
         return Err("not a JPEG".into());

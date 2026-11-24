@@ -1,4 +1,4 @@
-//! M1: ScreenCaptureKit display capture.
+//! ScreenCaptureKit display/window capture.
 //!
 //! Frames stay GPU-resident (IOSurface-backed `CVPixelBuffer`, NV12 `420v`) and are handed
 //! to the encoder untouched. SCK *pushes* frames on its own queue; `next_frame` pulls from a
@@ -60,7 +60,6 @@ pub fn init_window_server() {
     }
 }
 
-/// A captured video frame: an IOSurface-backed pixel buffer.
 pub struct Frame(pub CFRetained<CVPixelBuffer>);
 // CVPixelBuffer is an atomically ref-counted CF object; it is safe to move between threads.
 unsafe impl Send for Frame {}
@@ -289,7 +288,6 @@ pub struct SckCapture {
     _audio_queue: DispatchRetained<DispatchQueue>,
     rx: Receiver<Item>,
     audio_rx: Option<Receiver<PcmChunk>>,
-    /// Output size in pixels.
     pub width: usize,
     pub height: usize,
     last: Option<(CFRetained<CVPixelBuffer>, i64, Instant)>,
@@ -519,7 +517,6 @@ impl SckCapture {
 impl Capture for SckCapture {
     type Frame = Frame;
 
-    /// Blocks until a frame is available.
     fn next_frame(&mut self) -> Result<(Frame, i64), String> {
         loop {
             if let Some(f) = self.poll_frame(Duration::from_secs(1))? {

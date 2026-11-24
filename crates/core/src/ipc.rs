@@ -1,7 +1,4 @@
 //! Unix-socket server and client for the [`proto`](crate::proto) vocabulary.
-//!
-//! One connection can carry many request/response exchanges. Every `Command` frame gets exactly
-//! one `Event` frame in reply, in order. (Unsolicited events are not needed yet.)
 
 use crate::proto::{read_frame, write_frame, Command, Event};
 use std::io;
@@ -66,7 +63,6 @@ fn handle_conn<S: Service>(mut conn: UnixStream, service: Arc<S>, stop: Arc<Atom
     }
 }
 
-/// Blocking client.
 pub struct Client {
     conn: UnixStream,
 }
@@ -76,7 +72,6 @@ impl Client {
         Ok(Self { conn: UnixStream::connect(path)? })
     }
 
-    /// Send one command and wait for its reply.
     pub fn call(&mut self, cmd: &Command) -> io::Result<Event> {
         write_frame(&mut self.conn, cmd)?;
         read_frame::<_, Event>(&mut self.conn)?

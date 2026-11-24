@@ -1,15 +1,6 @@
 "use strict";
 
-// Linux Clips helper for Discord's discord_utils module.
-// On Linux, discord_utils.node leaves `windowHandle` unset on detected games and returns ""
-// from `getWindowHandleFromPid`. Discord's ClipsManager (`fireClipsInitEvent`) and saveClip
-// action both require a non-null `windowHandle` on the visible game to dispatch `CLIPS_INIT`,
-// set the clips source, and allow saving clips/screenshots.
-//
-// Synthesize a deterministic, non-colliding positive 32-bit handle for any detected game PID
-// whose native `windowHandle` is missing/zero, and map it back in `getPidFromWindowHandle`
-// and `getWindowHandleFromPid`.
-
+// Synthesize deterministic window handles for detected Linux games (discord_utils.node omits them).
 const SYNTH_BASE = 0x70000000;
 
 function attachUtilsHook(nativeUtils) {

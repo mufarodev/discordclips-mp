@@ -1,4 +1,4 @@
-//! M4: AAC-LC encoder on top of AudioToolbox's `AudioConverter`.
+//! AAC-LC encoder on top of AudioToolbox's `AudioConverter`.
 //!
 //! Input is interleaved f32 PCM with host-clock timestamps. Output packets are raw AAC frames
 //! (1024 samples, no ADTS) on a gapless timeline: capture gaps are filled with silence so the

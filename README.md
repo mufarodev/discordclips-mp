@@ -6,7 +6,6 @@ Written in Rust. Clean-room: built from observed behavior and public APIs, not d
 - [ARCHITECTURE.md](ARCHITECTURE.md) — pipeline design, traits, zero-copy paths
 - [PROTOCOL.md](PROTOCOL.md) — Unix-socket IPC command/event vocabulary
 - [INTEGRATION.md](INTEGRATION.md) — hooking into the Discord desktop client (macOS & Linux)
-- [ROADMAP.md](ROADMAP.md) — milestones and remaining work
 - [REFERENCE.md](REFERENCE.md) — observed Windows module interface notes
 
 ## Quick start

@@ -51,15 +51,12 @@ async function main() {
   const binDir = process.argv[2];
   assert(binDir && fs.existsSync(path.join(binDir, "clipsd")), "usage: node test_bridge.js <dir-with-clipsd>");
 
-  // Mock VoiceEngine & features (identical shape to discord_voice/index.js)
   const supported = new Set();
   const features = { declareSupported: (f) => supported.add(f) };
   const VoiceEngine = {};
 
   assert.strictEqual(typeof discordClipsMod.getModulePath(), "string");
   attachClipsBridge(VoiceEngine, features);
-
-  // 1. Verify renderer eligibility prerequisites (features + hasClipsV3Support)
   assert(supported.has("clips"), "must declare 'clips'");
   assert(supported.has("clips_thumbnail"), "must declare 'clips_thumbnail'");
   assert(supported.has("clips_recording_ready_events"), "must declare 'clips_recording_ready_events'");
@@ -73,8 +70,6 @@ async function main() {
   VoiceEngine.setClipsRecordingEnabled(true);
   VoiceEngine.setClipBufferLength(10);
   VoiceEngine.applyClipsSettings({ frameRate: 30, width: 1280, height: 720, bitrateKbps: 4000 });
-
-  // 2. Start capture (non-existent window id exercises fallback to main display)
   VoiceEngine.setClipsSource({ id: "screen:0", soundshareId: 0 });
   const deadline = Date.now() + 10000;
   while (!events.some((e) => e.code === 10 || e.code === 2) && Date.now() < deadline) {
@@ -85,12 +80,10 @@ async function main() {
   assert(events.some((e) => e.code === 10), "expected RecordingActive (10) event");
   assert(events.some((e) => e.code === 9), "expected RecordingHealthy (9) event");
 
-  // Buffer ~2.5s so we have at least one full GOP
   await new Promise((r) => setTimeout(r, 2500));
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clipsd-bridge-test-"));
   try {
-    // 3. saveClipEx (using steady-clock timestamps, matching Discord's real call shape)
     const clipPath = path.join(tmpDir, "test-clip.mp4");
     const initMeta = { id: "clip-test-1", applicationName: "TestApp", version: 1, type: "clip" };
     const nowMs = VoiceEngine.getSystemSteadyClockNowMs();
@@ -118,8 +111,6 @@ async function main() {
     assert.strictEqual(boxMeta.length, saveRes.duration);
     assert(boxMeta.thumbnail.startsWith("data:image/jpeg;base64,"));
     assert(!fs.existsSync(clipPath.replace(/\.mp4$/, ".jpg")), "must not leave stray .jpg sidecar");
-
-    // 4. updateClipMetadata
     const updatedMeta = { ...boxMeta, name: "Renamed Clip", isFavorite: true };
     await new Promise((resolve, reject) => {
       VoiceEngine.updateClipMetadata(clipPath, JSON.stringify(updatedMeta), resolve, (e) => reject(new Error(e)));
@@ -127,8 +118,6 @@ async function main() {
     const boxMeta2 = readDiscordUuidBox(clipPath);
     assert.strictEqual(boxMeta2.name, "Renamed Clip");
     assert.strictEqual(boxMeta2.isFavorite, true);
-
-    // 5. exportClipToFile
     const exportPath = path.join(tmpDir, "export", "out.mp4");
     const exp = await new Promise((resolve, reject) => {
       VoiceEngine.exportClipToFile(clipPath, exportPath, {}, (fp, fmt) => resolve({ fp, fmt }), (e) => reject(new Error(e)));
@@ -136,8 +125,6 @@ async function main() {
     assert.strictEqual(exp.fp, exportPath);
     assert.strictEqual(exp.fmt, false);
     assert.strictEqual(readDiscordUuidBox(exportPath).name, "Renamed Clip");
-
-    // 6. saveScreenshot
     const shotPath = path.join(tmpDir, "shot.jpeg");
     const shotMeta = { id: "shot-test-1", applicationName: "TestApp", version: 1, type: "screenshot" };
     const shotBuf = await new Promise((resolve, reject) => {
@@ -146,8 +133,6 @@ async function main() {
     assert(Buffer.isBuffer(shotBuf) && shotBuf[0] === 0xff && shotBuf[1] === 0xd8, "expected JPEG Buffer");
     const comment = readJpegComment(shotPath);
     assert.strictEqual(comment.id, "shot-test-1");
-
-    // 7. Stop recording
     VoiceEngine.setClipsSource({ id: "", soundshareId: 0 });
     await new Promise((r) => setTimeout(r, 300));
     assert(events.some((e) => e.code === 11), "expected RecordingInactive (11) event");

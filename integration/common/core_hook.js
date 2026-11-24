@@ -1,22 +1,14 @@
 "use strict";
 
-// Clean-room main-process hook for in-place macOS/Linux injection (Vencord-style).
-// Loaded by discord_desktop_core/index.js without modifying the host app binary or signature.
-// Makes `ensureModule("discord_clips")`, `requireModule("discord_clips")`, and
-// `getModulePath("discord_clips")` resolve to our local clipsd module directory.
-
 const Module = require("module");
 const path = require("path");
 const electron = require("electron");
 
 function beforeCoreLoad(clipsParentDir) {
-  // 1. Add clipsParentDir to Node's global module search paths before core.asar loads
-  //    so preload's `nativeModuleLoader` allows and resolves `requireModule("discord_clips")`.
   if (!Module.globalPaths.includes(clipsParentDir)) {
     Module.globalPaths.push(clipsParentDir);
   }
 
-  // 2. Wrap ipcMain.handle before core.asar registers DISCORD_NATIVE_MODULES_INSTALL.
   try {
     const ipc = electron?.ipcMain;
     if (ipc && typeof ipc.handle === "function" && !ipc.__clipsdHandleHooked) {
@@ -40,9 +32,6 @@ function beforeCoreLoad(clipsParentDir) {
 function afterCoreLoad(core, clipsParentDir) {
   const clipsDir = path.join(clipsParentDir, "discord_clips");
 
-  // 3. Patch `updater` inside `core.startup(bootstrapModules)` so `discord_clips`
-  //    is treated as already installed and committed (for `getModulePath("discord_clips")`
-  //    and `renderMontageRecipe`), never hitting Discord's CDN.
   if (core && typeof core.startup === "function" && !core.__clipsdHooked) {
     const origStartup = core.startup.bind(core);
     core.startup = function (bootstrapModules) {

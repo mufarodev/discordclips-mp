@@ -1,25 +1,13 @@
-//! Portable H.264 Annex-B ↔ AVCC conversion and SPS/PPS extraction.
-//!
-//! Hardware encoders on macOS (VideoToolbox) already emit AVCC (4-byte length-prefixed NALs)
-//! plus out-of-band SPS/PPS. Linux encoders via `libavcodec` (`h264_vaapi`, `h264_nvenc`,
-//! `libx264`) emit Annex-B (`00 00 00 01` / `00 00 01` start codes) with inline or extradata
-//! SPS/PPS. This module converts Annex-B packets into the AVCC `Packet` + `CodecConfig` shape
-//! expected by `clipsd_core::mux`.
+//! H.264 Annex-B <-> AVCC conversion and SPS/PPS extraction.
 
-/// Result of converting one Annex-B H.264 access unit into AVCC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvccFrame {
-    /// 4-byte big-endian length-prefixed NAL units (excluding AUD/SPS/PPS parameter sets).
     pub data: Vec<u8>,
-    /// True if the access unit contains an IDR slice (NAL unit type 5).
     pub keyframe: bool,
-    /// Inline SPS (NAL type 7), if present in this access unit.
     pub sps: Option<Vec<u8>>,
-    /// Inline PPS (NAL type 8), if present in this access unit.
     pub pps: Option<Vec<u8>>,
 }
 
-/// Split an Annex-B H.264 byte stream into raw NAL units (start codes stripped).
 pub fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
     let mut i = 0usize;
@@ -138,7 +126,6 @@ pub fn parse_extradata_sps_pps(extra: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         return Some((sps?, pps?));
     }
 
-    // Otherwise parse as Annex-B.
     let f = annex_b_to_avcc(extra);
     Some((f.sps?, f.pps?))
 }

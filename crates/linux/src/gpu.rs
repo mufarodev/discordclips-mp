@@ -1,16 +1,4 @@
-//! Zero-copy NVIDIA DMA-BUF → EGL/OpenGL → CUDA bridge.
-//!
-//! Dynamically loads `libEGL.so.1`, `libGL.so.1`, and `libcuda.so.1` via `dlopen` so the binary
-//! has zero link-time CUDA/EGL dependency and falls back cleanly to CPU/MemFd on non-NVIDIA GPUs.
-//!
-//! Data flow per frame (never touches CPU or system RAM):
-//!   PipeWire DMA-BUF fd + DRM modifier
-//!     → `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)`
-//!     → `glEGLImageTargetTexture2DOES(GL_TEXTURE_2D)`
-//!     → `glBlitFramebuffer` (GPU linear scale to encode W×H into `GL_RGBA8` FBO texture)
-//!     → `cuGraphicsMapResources` → `cuGraphicsSubResourceGetMappedArray`
-//!     → `cuMemcpy2DAsync_v2` (VRAM-to-VRAM copy into FFmpeg `AV_PIX_FMT_CUDA` `AVFrame`)
-//!     → `av1_nvenc` / `h264_nvenc`
+//! Zero-copy NVIDIA DMA-BUF -> EGL/OpenGL -> CUDA bridge (loaded dynamically via dlopen).
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -21,14 +9,12 @@ pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // 'X','R','2','4' -> PipeWire
 pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // 'A','R','2','4' -> PipeWire BGRA
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
-/// One plane of a DMA-BUF frame received from PipeWire.
 pub struct DmaBufPlane {
     pub fd: OwnedFd,
     pub offset: u32,
     pub stride: u32,
 }
 
-/// A GPU-resident DMA-BUF video frame (up to 4 planes).
 pub struct DmaBufFrame {
     pub width: u32,
     pub height: u32,
@@ -37,7 +23,6 @@ pub struct DmaBufFrame {
     pub planes: Vec<DmaBufPlane>,
 }
 
-// --- EGL constants ---
 const EGL_FALSE: c_uint = 0;
 const EGL_NONE: c_int = 0x3038;
 const EGL_VENDOR: c_int = 0x3053;
@@ -62,7 +47,6 @@ const PLANE_ATTRS: [[c_int; 5]; 4] = [
     [0x3440, 0x3441, 0x3442, 0x3449, 0x344A],
 ];
 
-// --- GL constants ---
 const GL_TEXTURE_2D: c_uint = 0x0DE1;
 const GL_RGBA8: c_int = 0x8058;
 const GL_RGBA: c_uint = 0x1908;
@@ -80,7 +64,6 @@ const GL_COLOR_ATTACHMENT0: c_uint = 0x8CE0;
 const GL_FRAMEBUFFER_COMPLETE: c_uint = 0x8CD5;
 const GL_COLOR_BUFFER_BIT: c_uint = 0x0000_4000;
 
-// --- CUDA constants & structs ---
 const CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY: c_uint = 1;
 const CU_MEMORYTYPE_DEVICE: u32 = 2;
 const CU_MEMORYTYPE_ARRAY: u32 = 3;
@@ -185,7 +168,6 @@ type CuGraphicsSubResourceGetMappedArrayFn =
 type CuMemcpy2DAsyncFn = unsafe extern "C" fn(*const CudaMemcpy2D, *mut c_void) -> c_int;
 
 struct GpuApi {
-    // Keep dlopen handles alive for the lifetime of the process.
     _egl_lib: *mut c_void,
     _gl_lib: *mut c_void,
     _cuda_lib: *mut c_void,

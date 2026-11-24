@@ -448,7 +448,6 @@ fn video_thread(
             }
         }
     }
-    // `cap` drops here: stops the SCK stream.
 }
 
 fn audio_thread(rx: Receiver<PcmChunk>, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>) {

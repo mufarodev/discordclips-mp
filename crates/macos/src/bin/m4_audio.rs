@@ -1,4 +1,4 @@
-//! M4 demo: capture system audio for N seconds and encode to AAC; report chunk/packet stats.
+//! Capture system audio for N seconds and encode to AAC.
 //! Play something while it runs. Usage: m4_audio [seconds]
 #[cfg(target_os = "macos")]
 fn main() {

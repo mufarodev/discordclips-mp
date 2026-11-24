@@ -1,4 +1,4 @@
-//! M1 demo: capture the main display for N seconds, log frame count + pts.
+//! Capture the main display for N seconds and log frame count + pts.
 //! Usage: m1_capture [seconds]   (default 5). Move something on screen while it runs.
 #[cfg(target_os = "macos")]
 fn main() {

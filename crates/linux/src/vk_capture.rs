@@ -1,9 +1,4 @@
-//! Direct zero-copy Vulkan swapchain DMA-BUF capture receiver.
-//!
-//! Connects to the dormant implicit Vulkan layer (`libclipsd_vk_layer.so`) over a private Linux
-//! abstract Unix socket (`\0clipsd-vk-<uid>-<pid>`), receives 2 ping-pong DMA-BUF staging image
-//! fds via `SCM_RIGHTS` once per swapchain, and emits `Frame::DmaBuf` directly into `GpuCudaBridge`
-//! with zero portal dialogs, zero Alt-Tab leaks, and zero CPU copies.
+//! Receiver for the implicit Vulkan DMA-BUF capture layer (`\0clipsd-vk-<uid>-<pid>`).
 
 use std::collections::{HashMap, HashSet};
 use std::mem::{self, MaybeUninit};
@@ -433,11 +428,9 @@ fn find_vk_socket(target_pid: Option<u32>) -> Option<(String, u32)> {
         return None;
     }
     if let Some(pid) = target_pid {
-        // 1. Exact PID match
         if let Some(hit) = active.iter().find(|(_, p)| *p == pid) {
             return Some(hit.clone());
         }
-        // 2. Descendant match (e.g. Steam/Proton wrapper -> game .exe)
         if let Some(hit) = active.iter().find(|(_, p)| is_descendant(*p, pid) || is_descendant(pid, *p)) {
             return Some(hit.clone());
         }

@@ -1,8 +1,4 @@
-//! M6: xdg-desktop-portal ScreenCast session & restore-token persistence.
-//!
-//! Opens a Wayland/X11-agnostic ScreenCast portal session via `ashpd`, persists the portal
-//! restore token under `$XDG_CONFIG_HOME/clipsd/restore_token` (so subsequent launches avoid
-//! re-prompting), and returns the PipeWire file descriptor + video node ID.
+//! xdg-desktop-portal ScreenCast session & restore-token persistence.
 
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -42,7 +38,6 @@ fn save_restore_token(token: &str) {
     let _ = std::fs::write(p, token);
 }
 
-/// Request a ScreenCast stream via xdg-desktop-portal (blocking wrapper around a one-shot tokio rt).
 pub fn open_screencast() -> Result<PortalStream, String> {
     // Multi-thread (1 worker): the runtime must keep driving zbus after `block_on` returns,
     // otherwise the portal session's D-Bus connection stalls and the stream dies.

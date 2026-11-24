@@ -1,9 +1,4 @@
-//! Portable AV1 OBU parsing, temporal-delimiter stripping, and `av1C` box payload construction.
-//!
-//! Per AV1-ISOBMFF:
-//! - MP4 samples contain raw OBUs with `OBU_TEMPORAL_DELIMITER` (type 2) stripped.
-//! - The `av1C` configuration box payload is a 4-byte `AV1CodecConfigurationRecord` header
-//!   (marker=1, version=1) followed by optional `configOBUs` (typically the sequence header OBU).
+//! AV1 OBU parsing, temporal-delimiter stripping, and `av1C` box construction.
 
 pub const OBU_SEQUENCE_HEADER: u8 = 1;
 pub const OBU_TEMPORAL_DELIMITER: u8 = 2;
@@ -11,24 +6,17 @@ pub const OBU_FRAME_HEADER: u8 = 3;
 pub const OBU_FRAME: u8 = 6;
 pub const OBU_PADDING: u8 = 15;
 
-/// Parsed view of a single OBU inside a byte slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Obu<'a> {
     pub obu_type: u8,
-    /// Complete OBU bytes (header + optional size + payload).
     pub raw: &'a [u8],
-    /// Payload bytes after the OBU header (and extension/size fields).
     pub payload: &'a [u8],
 }
 
-/// Result of preparing one AV1 access unit for MP4 storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Av1Sample {
-    /// Sample bytes with temporal delimiters / padding removed.
     pub data: Vec<u8>,
-    /// True if this access unit starts with a sequence header or a keyframe.
     pub keyframe: bool,
-    /// Raw `OBU_SEQUENCE_HEADER` bytes, if present in this access unit.
     pub seq_header: Option<Vec<u8>>,
 }
 
@@ -43,7 +31,6 @@ fn read_leb128(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// Split an AV1 OBU bitstream into individual OBUs.
 pub fn split_obus(data: &[u8]) -> Vec<Obu<'_>> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -246,7 +233,6 @@ mod tests {
         let s = prepare_av1_sample(&stream);
         assert!(s.keyframe);
         assert_eq!(s.seq_header.as_deref(), Some(&[0x0A, 0x04, 0x0A, 0x00, 0x00, 0x00][..]));
-        // Temporal delimiter must be stripped
         assert_eq!(s.data, &[0x0A, 0x04, 0x0A, 0x00, 0x00, 0x00, 0x32, 0x03, 0x00, 0x11, 0x22]);
 
         let av1c = build_av1c(&s.seq_header.unwrap()).unwrap();

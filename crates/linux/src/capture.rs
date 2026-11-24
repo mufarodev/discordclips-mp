@@ -30,7 +30,6 @@ use crate::portal::{self, PortalStream};
 const REPEAT_AFTER: Duration = Duration::from_millis(100);
 const MIN_FRAME_GAP_US: i64 = 5_000;
 
-/// Pixel format of a CPU-accessible frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     Bgra,
@@ -38,7 +37,6 @@ pub enum PixelFormat {
     Nv12,
 }
 
-/// CPU-resident video frame (MemFd/MemPtr fallback or synthetic test frames).
 #[derive(Clone)]
 pub struct CpuFrame {
     pub width: u32,
@@ -48,15 +46,12 @@ pub struct CpuFrame {
     pub data: Vec<u8>,
 }
 
-/// One captured Linux video frame: either zero-copy GPU DMA-BUF, a static-screen repeat of the
-/// last GPU frame already in VRAM, or a CPU buffer fallback.
 pub enum Frame {
     Cpu(CpuFrame),
     DmaBuf(DmaBufFrame),
     RepeatLastGpu,
 }
 
-/// A chunk of captured PipeWire audio: interleaved f32 PCM at `pts_us` (CLOCK_MONOTONIC).
 pub struct PcmChunk {
     pub pts_us: i64,
     pub sample_rate: u32,
@@ -271,10 +266,6 @@ impl Drop for PwCapture {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// PipeWire thread
-// ---------------------------------------------------------------------------------------------
-
 struct PwThreadArgs {
     fd: std::os::fd::OwnedFd,
     node_id: u32,
@@ -402,7 +393,6 @@ fn video_enum_format(
     serialize_pod(obj)
 }
 
-/// Buffers param specifying allowed buffer data types.
 fn buffers_param(allow_dmabuf: bool) -> Vec<u8> {
     let mut mask = (1i32 << DataType::MemFd.as_raw()) | (1i32 << DataType::MemPtr.as_raw());
     if allow_dmabuf {

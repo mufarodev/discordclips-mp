@@ -1,7 +1,6 @@
 //! Platform-independent core: the two traits platforms implement, plus the ring buffer.
 use std::collections::VecDeque;
 
-/// One encoded video packet (AVCC, as VideoToolbox emits; Linux encoders must match).
 #[derive(Clone, Debug)]
 pub struct Packet {
     pub pts_us: i64,
@@ -9,7 +8,6 @@ pub struct Packet {
     pub data: Vec<u8>,
 }
 
-/// Platform seam #1: screen capture. Frames stay GPU-resident; `Frame` is platform-defined.
 pub trait Capture {
     type Frame;
     fn next_frame(&mut self) -> Result<(Self::Frame, i64 /* pts_us */), String>;
@@ -48,7 +46,6 @@ pub struct AudioConfig {
     pub bitrate_bps: u32,
 }
 
-/// Samples per AAC-LC frame.
 pub const AAC_FRAME_SAMPLES: u32 = 1024;
 
 /// Rolling buffer of encoded audio packets (every AAC frame is independently decodable, so
@@ -83,15 +80,10 @@ impl AudioRing {
     }
 }
 
-/// Platform seam #2: hardware encoder.
 pub trait Encoder {
     type Frame;
-    /// Submit a frame. Encoders may be asynchronous: this returns whatever packets have
-    /// finished since the previous call, which may be none (or packets for earlier frames).
     fn encode(&mut self, frame: Self::Frame, pts_us: i64) -> Result<Vec<Packet>, String>;
-    /// Force out and return all in-flight packets.
     fn flush(&mut self) -> Result<Vec<Packet>, String>;
-    /// Available once the first keyframe has been produced.
     fn codec_config(&self) -> Option<CodecConfig>;
 }
 
@@ -122,12 +114,10 @@ impl Ring {
         }
     }
 
-    /// Change the retention window; takes effect on the next `push`.
     pub fn set_window(&mut self, window_secs: u32) {
         self.window_us = window_secs as i64 * 1_000_000;
     }
 
-    /// Time span currently buffered (newest pts - oldest pts).
     pub fn buffered_us(&self) -> i64 {
         match (self.pkts.front(), self.pkts.back()) {
             (Some(a), Some(b)) => b.pts_us - a.pts_us,
@@ -135,7 +125,6 @@ impl Ring {
         }
     }
 
-    /// Total encoded bytes held.
     pub fn bytes(&self) -> usize {
         self.pkts.iter().map(|p| p.data.len()).sum()
     }
@@ -158,7 +147,6 @@ impl Ring {
 mod tests {
     use super::*;
     fn feed(r: &mut Ring, secs: i64) {
-        // 1 fps, keyframe every 2s
         for s in 0..secs {
             r.push(Packet { pts_us: s * 1_000_000, keyframe: s % 2 == 0, data: vec![] });
         }
@@ -200,7 +188,6 @@ pub mod mux {
     use super::{AudioConfig, CodecConfig, Packet, AAC_FRAME_SAMPLES};
     use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 
-    /// Media timescale for the video track.
     const TIMESCALE: u32 = 90_000;
 
     /// Write `packets` (as returned by `Ring::snapshot`, so starting on a keyframe) as an MP4
@@ -322,7 +309,6 @@ pub mod mux {
             None
         };
 
-        // Video samples: (time_us, track, Mp4Sample).
         let ticks = |p: &Packet| ((p.pts_us - first.pts_us) as i128 * TIMESCALE as i128 / 1_000_000) as u64;
         let mut prev_dur = (TIMESCALE / 30) as u32;
         let mut items: Vec<(i64, u32, Mp4Sample)> = Vec::with_capacity(packets.len());
@@ -471,19 +457,14 @@ pub mod mux {
         let mut out = vec![0u8; total];
         out[0..4].copy_from_slice(&(total as u32).to_be_bytes());
         out[4..8].copy_from_slice(b"av01");
-        // data_reference_index = 1
         out[14..16].copy_from_slice(&1u16.to_be_bytes());
         out[32..34].copy_from_slice(&width.to_be_bytes());
         out[34..36].copy_from_slice(&height.to_be_bytes());
-        // horiz/vert resolution = 72 dpi (0x00480000)
         out[36..40].copy_from_slice(&0x0048_0000u32.to_be_bytes());
         out[40..44].copy_from_slice(&0x0048_0000u32.to_be_bytes());
-        // frame_count = 1
         out[48..50].copy_from_slice(&1u16.to_be_bytes());
-        // depth = 24, pre_defined = -1
         out[82..84].copy_from_slice(&0x0018u16.to_be_bytes());
         out[84..86].copy_from_slice(&0xFFFFu16.to_be_bytes());
-        // child `av1C` box
         out[86..90].copy_from_slice(&(av1c_box_len as u32).to_be_bytes());
         out[90..94].copy_from_slice(b"av1C");
         out[94..].copy_from_slice(av1c);
