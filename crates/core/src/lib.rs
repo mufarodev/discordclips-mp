@@ -138,7 +138,10 @@ pub mod mux {
                 major_brand: FourCC { value: *b"isom" },
                 minor_version: 512,
                 compatible_brands: [*b"isom", *b"iso2", *b"avc1", *b"mp41"].map(|value| FourCC { value }).to_vec(),
-                timescale: 1000,
+                // Must equal the track timescale: mp4 truncates each sample's duration when
+                // converting to the movie timescale, which shortens the movie (~0.3 ms/frame
+                // at 1000) and makes players cut off the end of the clip.
+                timescale: TIMESCALE,
             },
         )
         .map_err(e)?;
@@ -204,6 +207,9 @@ pub mod mux {
             assert!(r.read_sample(id, 61).unwrap().unwrap().is_sync);
             let d = r.tracks()[&id].duration().as_secs_f64();
             assert!((d - 90.0 * 0.033333).abs() < 0.05, "duration {d}");
+            // Movie-level duration (what players honour) must equal the media duration.
+            let movie = r.duration().as_secs_f64();
+            assert!((movie - d).abs() < 0.001, "movie {movie} vs media {d}");
         }
 
         #[test]
