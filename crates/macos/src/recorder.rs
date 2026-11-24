@@ -230,7 +230,15 @@ impl Recorder {
             Ok(()) => Some(thumb_path.to_string_lossy().into_owned()),
             Err(_) => None, // a missing thumbnail must not fail the clip
         };
+        // First audio packet's start relative to the first video frame (ms). The muxer puts the
+        // first kept audio packet at track time 0, so a clearly positive value means audio
+        // would play early by that amount.
+        let audio_lag_ms = audio_ref.and_then(|(_, a)| {
+            let first_audio = a.iter().map(|p| p.pts_us).min()?;
+            Some((first_audio - pkts[0].pts_us) as f64 / 1000.0)
+        });
         let stats_json = serde_json::json!({
+            "audio_start_after_video_ms": audio_lag_ms,
             "video_packets": pkts.len(),
             "audio_packets": audio_packets,
             "width": cfg.width,
@@ -311,6 +319,9 @@ fn video_thread(
             return;
         }
     };
+    if let Some(ms) = std::env::var("CLIPSD_TEST_INIT_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(Duration::from_millis(ms)); // test hook: simulate a slow encoder start
+    }
     let mut ecfg = EncoderConfig::new(cap.width, cap.height);
     ecfg.fps = fps as i32;
     ecfg.bitrate_bps = bitrate_kbps as i32 * 1000;
@@ -321,6 +332,7 @@ fn video_thread(
             return;
         }
     };
+    cap.flush_backlog(); // drop frames that queued up during encoder init (see flush_backlog)
     let _ = init.send(Ok((cap.width as u32, cap.height as u32, cap.take_audio())));
     let trace = std::env::var_os("CLIPSD_TRACE").is_some();
     let t_start = std::time::Instant::now();

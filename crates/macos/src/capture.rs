@@ -392,6 +392,15 @@ impl SckCapture {
         Ok(Self { stream, _sink: sink, _queue: queue, _audio_queue: audio_queue, rx, audio_rx: cfg.audio.then_some(arx), width, height, last: None, last_emitted_us: i64::MIN, trace: std::env::var_os("CLIPSD_TRACE").is_some(), t0: Instant::now(), last_real_pts: 0, repeats: 0 })
     }
 
+    /// Discard frames queued while the consumer was still starting up (encoder init can take
+    /// hundreds of ms while SCK is already streaming). Without this, the first frames submitted
+    /// are stale and the next fresh one is a whole init-duration later: a hole in the clip.
+    pub fn flush_backlog(&mut self) {
+        while self.rx.try_recv().is_ok() {}
+        self.last = None;
+        self.last_emitted_us = i64::MIN;
+    }
+
     /// Take the audio chunk receiver (once). `None` if audio capture is off or already taken.
     pub fn take_audio(&mut self) -> Option<Receiver<PcmChunk>> {
         self.audio_rx.take()

@@ -33,7 +33,12 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [ ] ML detection (ONNX Runtime, open model) → `MlDetection` events
 - [ ] Write-up / demo for Discord engineers
 
-## Open issues
-- **Intermittent startup hole in video**: in ~3 of ~16 fresh `clipsd start` runs, the first 1–2 s of the buffer had a 0.7–2.1 s gap between video frames (never seen later in a recording, never with 0 audio-packet drops affected). Root cause unknown. Ruled out: encoder frame drops (stat added; repeat test emits every frame), loop stalls (traced). Mitigations applied: SCK `queueDepth` 8, channel depth 2, separate audio dispatch queue, real frames never dropped. After those, 0 of ~9 runs reproduced. Diagnose with `CLIPSD_TRACE=1 clipsd start`.
-- A/V sync has not been verified by eye/ear (only timestamps).
+## Fixed
+- **Startup hole in video** (first 1–2 s of a recording had a 0.7–2.1 s frame gap in ~3 of ~16 runs). Cause: encoder init takes hundreds of ms while ScreenCaptureKit is already streaming, so the channel filled with stale frames and the next fresh frame was an init-duration later (and `MaxKeyFrameIntervalDuration` forced a keyframe after the hole). Fix: `SckCapture::flush_backlog()` once the encoder is ready. Proven with `CLIPSD_TEST_INIT_DELAY_MS` (1 s and 2.5 s injected delays → max gap 50 ms; before the fix the gap equalled the delay).
+
+## Open issues / not verified
+- A/V sync checked by timestamps only (audio starts 6–17 ms before video, within one AAC frame), not by eye/ear.
 - TCC-denied error path untested; QuickTime not opened by eye (AVFoundation `isPlayable` only).
+- Discord UI: clips pass a mirror of the main-process `uuid`-box check, but nobody has loaded one in the real client; the renderer's metadata schema is unknown (default `{}`).
+- `SetBitrate` is acknowledged but the resulting bitrate change was not measured.
+- Static-screen repeat path is exercised by `m2_static` (encoder) but not end-to-end on a truly idle display.
